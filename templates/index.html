@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>실시간 방송 자막</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='live.css') }}">
+</head>
+<body>
+  <!-- ===== 메인(입장) 화면 ===== -->
+  <section id="lobby" class="view">
+    <div class="lobby-box">
+      <h1>실시간 방송 자막</h1>
+      <p class="sub">자리를 골라 입장하세요. 먼저 들어온 <b>2명</b>이 작업자, 그다음부터는 <b>관전자</b>로 들어가요.</p>
+      <div id="seat-grid" class="seat-grid"></div>
+      <p id="lobby-full" class="lobby-full hidden">자리가 모두 찼어요 (최대 6명).</p>
+    </div>
+  </section>
+
+  <!-- ===== 작업 화면 ===== -->
+  <section id="room" class="view hidden">
+    <header class="topbar">
+      <div class="brand">실시간 방송 자막</div>
+      <div class="me">
+        <span id="me-role" class="badge"></span>
+        <span id="me-name" class="me-name"></span>
+        <button id="me-rename" class="icon-btn" title="내 이름 바꾸기">✏️</button>
+        <button id="phrase-btn" class="btn ghost">상용구</button>
+        <button id="leave-btn" class="btn ghost">나가기</button>
+      </div>
+      <div class="queue">
+        <span class="queue-label">대기열</span>
+        <div id="queue-list" class="queue-list"></div>
+      </div>
+    </header>
+
+    <main class="work-grid">
+      <section class="panel video-panel">
+        <div class="panel-head">
+          <span>방송 영상</span>
+          <span class="head-actions key-hint-inline"><kbd>F7</kbd> 2초 뒤로 <kbd>F9</kbd> 2초 앞으로</span>
+        </div>
+        <form id="yt-form" class="yt-form" autocomplete="off">
+          <input id="yt-url" type="text" inputmode="url" spellcheck="false"
+                 placeholder="유튜브 링크 (watch?v= · youtu.be · /live/ · /shorts/)">
+          <button id="yt-open" class="btn small" type="submit">열기</button>
+        </form>
+        <div class="panel-body video-body">
+          <div id="yt-empty" class="yt-empty">유튜브 링크를 넣고 "열기"를 누르세요.<br>영상은 내 화면에서만 재생돼요.</div>
+          <div id="yt-wrap" class="yt-wrap hidden">
+            <div id="yt-player"></div>
+            <div id="yt-flash" class="yt-flash hidden"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel writers">
+        <div id="writer-0" class="writer"></div>
+        <div id="writer-1" class="writer"></div>
+        <div id="key-hint" class="key-hint hidden">
+          <span><kbd>F1</kbd> 송출</span>
+          <span><kbd>F3</kbd> 상용구 출력</span>
+          <span><kbd>F10</kbd> 상용구 등록 (입력어:출력어)</span>
+          <span><kbd>F4</kbd> 내 마지막 어절 삭제</span>
+          <span><kbd>F8</kbd> 상대 첫 어절 삭제</span>
+          <span><kbd>F12</kbd> 내 칸 전체 지우기</span>
+          <span><kbd>Insert</kbd> 턴 넘기기</span>
+        </div>
+      </section>
+
+      <section class="panel history-panel">
+        <div class="panel-head">
+          <span>송출 이력</span>
+          <div class="head-actions">
+            <button id="history-download" class="btn ghost small">다운로드(.txt)</button>
+            <button id="history-clear" class="btn ghost small">초기화</button>
+          </div>
+        </div>
+        <div id="history" class="panel-body history-body" data-empty="송출된 자막이 여기에 쌓여요"></div>
+      </section>
+    </main>
+  </section>
+
+  <!-- ===== 상용구 목록 창 ===== -->
+  <div id="phrase-modal" class="modal-backdrop hidden">
+    <div class="modal" role="dialog" aria-labelledby="phrase-title">
+      <div class="modal-head">
+        <span id="phrase-title">상용구 <span id="phrase-count" class="tag"></span></span>
+        <button id="phrase-close" class="icon-btn" title="닫기 (Esc)">✕</button>
+      </div>
+      <p class="modal-help">
+        입력칸 한 줄에 <b>입력어:출력어</b>를 치고 <kbd>F10</kbd> → 등록.
+        어절을 친 직후 <kbd>F3</kbd> → 출력어로 바뀌어요. 이 브라우저에만 저장돼요.
+      </p>
+      <ul id="phrase-list" class="phrase-list"></ul>
+    </div>
+  </div>
+
+  <div id="conn" class="conn hidden">서버와 다시 연결하는 중…</div>
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="{{ url_for('static', filename='socket.io.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='live.js') }}"></script>
+</body>
+</html>
