@@ -113,7 +113,7 @@ button.chip.clickable:hover { filter: brightness(.96); }
 .writer.main { border-color: var(--green); box-shadow: 0 0 0 3px var(--green-soft); }
 .writer textarea[readonly] { color: #374151; cursor: default; }
 
-/* 입력칸 = 노란 줄 배경 레이어(.box-hl) 위에 투명한 textarea를 겹침.
+/* 입력칸 = 송출 표시 배경 레이어(.box-hl) 위에 투명한 textarea를 겹침.
    두 층의 글꼴·크기·줄간격·패딩·줄바꿈 규칙이 같아야 줄 위치가 정확히 맞아요. */
 .box-wrap { flex: 1; position: relative; min-height: 0; border-radius: 0 0 12px 12px; overflow: hidden; background: var(--card); }
 .box-wrap.ro { background: #fafbfc; }
@@ -124,8 +124,10 @@ button.chip.clickable:hover { filter: brightness(.96); }
   white-space: pre-wrap; overflow-wrap: break-word; word-break: normal;
   color: transparent; overflow: hidden; pointer-events: none; user-select: none;
 }
-.hl-line.on { background: #fff3b0; margin: 0 -12px; padding: 0 12px; }
-.turn-tag { font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 999px; background: var(--gray-soft); color: var(--muted); }
+/* 송출된 부분: 연한 파랑 / 대기 작업자가 Enter → 칸 전체 연한 노랑 */
+.box-hl .sent { background: #cfe0ff; border-radius: 3px; }
+.box-wrap.standby, .box-wrap.ro.standby { background: #fff3b0; }
+.turn-tag { font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 999px; background: #fff1e0; color: #e07b00; }
 .turn-tag.on { background: var(--green-soft); color: var(--green); }
 .writer-head .pass-btn { margin-left: auto; }
 .btn.small { padding: 4px 10px; font-size: 13px; }
@@ -134,7 +136,7 @@ button.chip.clickable:hover { filter: brightness(.96); }
 kbd { font: inherit; font-size: 11px; font-weight: 700; padding: 1px 5px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; background: var(--card); color: var(--text); }
 .panel-head { display: flex; align-items: center; gap: 8px; }
 .head-actions { margin-left: auto; display: flex; gap: 6px; }
-.history-body { white-space: pre-wrap; word-break: break-all; font-size: 16px; line-height: 1.6; }
+.history-body { white-space: pre-wrap; word-break: break-all; font-size: var(--hist-font, 22px); line-height: 1.75; }
 .history-body:empty::before { content: attr(data-empty); color: var(--muted); font-size: 14px; }
 .writer.empty { border-style: dashed; }
 .writer.empty .writer-body { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 14px; }
@@ -160,6 +162,29 @@ kbd { font: inherit; font-size: 11px; font-weight: 700; padding: 1px 5px; border
   position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
   background: rgba(0, 0, 0, .65); color: #fff; font-weight: 700; font-size: 18px;
   padding: 8px 16px; border-radius: 999px; pointer-events: none;
+}
+
+/* 관전자: 플레이어 위 투명 막 (보기만) / 자동재생이 막혔을 때 안내 버튼 */
+.yt-shield { position: absolute; inset: 0; z-index: 2; cursor: not-allowed; }
+.yt-unlock {
+  position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); z-index: 3;
+  border: none; border-radius: 999px; padding: 10px 18px; font-weight: 700; font-size: 15px;
+  background: rgba(0, 0, 0, .78); color: #fff; box-shadow: 0 4px 14px rgba(0, 0, 0, .3);
+}
+.yt-unlock:hover { background: rgba(0, 0, 0, .9); }
+.yt-flash { z-index: 3; }
+
+/* ---------- 송출 이력 크게 보기 ---------- */
+.big-view { position: fixed; inset: 0; z-index: 40; background: #000; color: #fff; display: flex; flex-direction: column; }
+.big-bar { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 14px; opacity: .35; transition: opacity .2s; }
+.big-bar:hover, .big-bar:focus-within { opacity: 1; }
+.big-btn { border: 1px solid #555; background: #111; color: #fff; border-radius: 8px; padding: 6px 12px; font-weight: 700; }
+.big-btn:hover { background: #222; }
+.big-text {
+  flex: 1; overflow: auto; padding: 0 6vw 5vh;
+  white-space: pre-wrap; word-break: keep-all; overflow-wrap: anywhere;
+  font-size: var(--big-font, 56px); line-height: 1.5; font-weight: 700;
+  text-shadow: 0 2px 6px rgba(0, 0, 0, .8);
 }
 
 /* ---------- 상용구 창 ---------- */

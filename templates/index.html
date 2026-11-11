@@ -38,7 +38,7 @@
       <section class="panel video-panel">
         <div class="panel-head">
           <span>방송 영상</span>
-          <span class="head-actions key-hint-inline"><kbd>F7</kbd> 2초 뒤로 <kbd>F9</kbd> 2초 앞으로</span>
+          <span class="head-actions key-hint-inline"><kbd>F2</kbd> 재생/정지 <kbd>F7</kbd> 2초 뒤로 <kbd>F9</kbd> 2초 앞으로</span>
         </div>
         <form id="yt-form" class="yt-form" autocomplete="off">
           <input id="yt-url" type="text" inputmode="url" spellcheck="false"
@@ -46,10 +46,12 @@
           <button id="yt-open" class="btn small" type="submit">열기</button>
         </form>
         <div class="panel-body video-body">
-          <div id="yt-empty" class="yt-empty">유튜브 링크를 넣고 "열기"를 누르세요.<br>영상은 내 화면에서만 재생돼요.</div>
+          <div id="yt-empty" class="yt-empty">유튜브 링크를 넣고 "열기"를 누르세요.<br>방에 있는 모두에게 같은 영상이 재생돼요.</div>
           <div id="yt-wrap" class="yt-wrap hidden">
             <div id="yt-player"></div>
+            <div id="yt-shield" class="yt-shield hidden" title="영상 조작은 작업자만 할 수 있어요"></div>
             <div id="yt-flash" class="yt-flash hidden"></div>
+            <button id="yt-unlock" class="yt-unlock hidden" type="button">🔇 클릭해서 소리 켜기</button>
           </div>
         </div>
       </section>
@@ -58,13 +60,15 @@
         <div id="writer-0" class="writer"></div>
         <div id="writer-1" class="writer"></div>
         <div id="key-hint" class="key-hint hidden">
-          <span><kbd>F1</kbd> 송출</span>
+          <span>완성 어절 3개 → 맨 앞 자동 송출</span>
+          <span><kbd>F1</kbd> 첫 어절 바로 송출</span>
           <span><kbd>F3</kbd> 상용구 출력</span>
           <span><kbd>F10</kbd> 상용구 등록 (입력어:출력어)</span>
-          <span><kbd>F4</kbd> 내 마지막 어절 삭제</span>
-          <span><kbd>F8</kbd> 상대 첫 어절 삭제</span>
+          <span><kbd>F4</kbd> 내 마지막 어절 삭제(송출 전)</span>
+          <span><kbd>F8</kbd> 상대 첫 어절 삭제(송출 전)</span>
           <span><kbd>F12</kbd> 내 칸 전체 지우기</span>
-          <span><kbd>Insert</kbd> 턴 넘기기</span>
+          <span><kbd>Insert</kbd> 남은 글 송출 + 턴 넘기기</span>
+          <span>대기 중 <kbd>Enter</kbd> 노란 창(준비됨)</span>
         </div>
       </section>
 
@@ -72,6 +76,9 @@
         <div class="panel-head">
           <span>송출 이력</span>
           <div class="head-actions">
+            <button id="font-down" class="btn ghost small" title="글자 작게">A-</button>
+            <button id="font-up" class="btn ghost small" title="글자 크게">A+</button>
+            <button id="big-btn" class="btn ghost small" title="송출 이력만 화면 전체에 크게">크게 보기</button>
             <button id="history-download" class="btn ghost small">다운로드(.txt)</button>
             <button id="history-clear" class="btn ghost small">초기화</button>
           </div>
@@ -90,10 +97,20 @@
       </div>
       <p class="modal-help">
         입력칸 한 줄에 <b>입력어:출력어</b>를 치고 <kbd>F10</kbd> → 등록.
-        어절을 친 직후 <kbd>F3</kbd> → 출력어로 바뀌어요. 이 브라우저에만 저장돼요.
+        어절을 친 직후 <kbd>F3</kbd> → 출력어로 바뀌어요. 내 이름으로 서버에 저장돼요 (작업자마다 따로).
       </p>
       <ul id="phrase-list" class="phrase-list"></ul>
     </div>
+  </div>
+
+  <!-- ===== 송출 이력 크게 보기 (방송 자막처럼) ===== -->
+  <div id="big-view" class="big-view hidden">
+    <div class="big-bar">
+      <button id="big-font-down" class="big-btn" title="글자 작게">A-</button>
+      <button id="big-font-up" class="big-btn" title="글자 크게">A+</button>
+      <button id="big-close" class="big-btn" title="돌아가기 (Esc)">돌아가기 ✕</button>
+    </div>
+    <div id="big-text" class="big-text"></div>
   </div>
 
   <div id="conn" class="conn hidden">서버와 다시 연결하는 중…</div>

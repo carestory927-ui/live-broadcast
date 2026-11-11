@@ -6,11 +6,20 @@
 - 턴(main_seat)을 가진 작업자만 송출(F1)할 수 있어요.
 
 [입력칸 동기화 방식]
-작업자는 자기 칸의 전체 글을 입력할 때마다 서버로 보내요.
-서버가 그 칸의 앞부분을 잘라내는 경우(F1 송출, 상대의 F8 삭제)는 "잘라내기 기록"(ext_ops)에 남기고
-버전(ext_ver)을 올려요. 작업자가 그 사실을 아직 모른 채 보낸 글(옛 버전)이 도착하면
-서버가 같은 잘라내기를 다시 적용해서, 잘린 어절이 되살아나지 않게 해요.
+작업자는 자기 칸의 전체 글을 입력할 때마다 서버로 보내요. 칸의 글을 바꾸는 건 언제나 그 칸 주인의 브라우저예요
+(상대의 F8 삭제도 서버가 주인 브라우저에 "지워줘"라고 전달해서 주인이 지워요).
+
+[송출 위치]
+칸마다 "어디까지 송출됐는지"(sent, 글자 위치)를 서버가 관리해요. 앞쪽 [0, sent)는 송출된 부분이라 고칠 수 없고
+파란 배경으로 보여요. 작성중 작업자의 브라우저가 "여기까지 송출" 요청(send_upto)을 보내면 서버가 검사한 뒤
+그 사이 어절들을 송출 이력에 붙이고 sent를 옮겨요 (자동 송출 / F1 / Insert).
+
+[송출된 부분 정리]
+송출된 부분이 길어지면 서버가 칸 앞쪽(송출된 부분)을 잘라내요. 이 잘라내기만 "잘라내기 기록"(ext_ops)에 남기고
+버전(ext_ver)을 올려요. 작업자가 그 사실을 아직 모른 채 보낸 글(옛 버전)이 도착하면 서버가 같은 잘라내기를
+다시 적용하고, 옛 버전 기준의 송출 위치도 그만큼 당겨서 해석해요.
 """
+import json
 import os
 import re
 import secrets
@@ -35,6 +44,47 @@ OPS_KEEP = 100       # 칸마다 기억해 둘 잘라내기 기록 수
 
 lock = threading.RLock()
 
+# ---------- 상용구 (작업자 이름별, 서버 파일에 저장) ----------
+# DATA_DIR/snippets.json = { "작업자 이름": { "입력어": "출력어", ... }, ... }
+# Railway에선 Volume을 /data에 붙이고 DATA_DIR=/data 로 두면 재배포해도 남아요.
+DATA_DIR = os.environ.get("DATA_DIR", "./data")
+SNIPPETS_FILE = os.path.join(DATA_DIR, "snippets.json")
+SNIP_KEY_MAX = 50
+SNIP_OUT_MAX = 2000
+SNIP_PER_USER = 3000
+snip_lock = threading.Lock()
+
+
+def _load_snippets():
+    try:
+        with open(SNIPPETS_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        print(f"[snippets] {SNIPPETS_FILE} 읽기 실패: {e}", flush=True)
+        return {}
+    out = {}
+    if isinstance(raw, dict):
+        for name, d in raw.items():
+            if isinstance(name, str) and isinstance(d, dict):
+                out[name] = {k: v for k, v in d.items() if isinstance(k, str) and isinstance(v, str)}
+    return out
+
+
+snippets = _load_snippets()
+
+
+def _save_snippets():
+    """임시 파일에 쓴 뒤 바꿔치기 → 저장 도중 꺼져도 파일이 깨지지 않아요. snip_lock 안에서 호출."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = SNIPPETS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(snippets, f, ensure_ascii=False, indent=1, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, SNIPPETS_FILE)
+
 
 def _empty_seat(i, name=None):
     return {
@@ -46,6 +96,7 @@ def _empty_seat(i, name=None):
         "joined_at": None,
         "online": False,
         "ready": False,     # 관전자의 초록불 (작업하고 싶다는 신호)
+        "standby": False,   # 대기 작업자의 노란 창 (Enter → 이어받을 준비 됐다는 신호)
     }
 
 
@@ -55,11 +106,13 @@ sid_to_seat = {}
 main_seat = None                      # 턴을 가진(작성중) 작업자 자리
 texts = {i: "" for i in range(MAX_SEATS)}    # 자리별 입력칸 내용
 ext_ver = {i: 0 for i in range(MAX_SEATS)}   # 자리별 "서버가 잘라낸" 횟수 (버전)
-ext_ops = {i: [] for i in range(MAX_SEATS)}  # [(버전, 잘라낸 앞부분, "send"|"delete"), ...]
-marks = {i: [] for i in range(MAX_SEATS)}    # 자리별 노란 줄 [[줄 시작, 그 줄의 \n 위치], ...]
+ext_ops = {i: [] for i in range(MAX_SEATS)}  # [(버전, 잘라낸 앞부분), ...] — 송출된 부분 정리 기록
+sent = {i: 0 for i in range(MAX_SEATS)}      # 자리별 송출 위치: texts[i][:sent[i]]는 이미 송출됨
 history = ""                          # 송출 이력 전체 글
 
 FIRST_WORD = re.compile(r"(\s*)(\S+)(\s*)")
+TRIM_AT = 500        # 송출된 부분이 이만큼 쌓이면
+TRIM_KEEP = 200      # 뒤쪽 이만큼만 남기고 앞을 정리
 
 
 # ---------- 상태 도우미 ----------
@@ -76,6 +129,7 @@ def public_state():
                 "role": s["role"],
                 "online": s["online"],
                 "ready": s["ready"],
+                "standby": s["standby"],
                 "order": s["joined_at"],
             }
             for s in seats
@@ -84,6 +138,9 @@ def public_state():
 
 
 def broadcast():
+    # 턴을 받은 작업자의 노란 창은 꺼요 (턴이 바뀌는 모든 경로를 여기서 한 번에 처리)
+    if main_seat is not None:
+        seats[main_seat]["standby"] = False
     socketio.emit("state", public_state())
 
 
@@ -158,71 +215,68 @@ def my_seat():
     return seat_id
 
 
-def cut_marks(ms, n, kind):
-    """앞에서 n글자를 잘라냈을 때 노란 줄 위치를 고쳐요.
-    - 잘린 부분보다 뒤에 있던 줄: 그대로 (위치만 당김)
-    - 송출(send)로 줄 앞부분만 나간 줄: 남은 부분은 계속 노란색
-    - 삭제(delete, F8)로 건드려진 줄 / 통째로 나간 줄: 표시 사라짐
-    """
-    out = []
-    for a, b in ms:
-        if a >= n:
-            out.append([a - n, b - n])
-        elif kind == "send" and n <= b - 1:
-            out.append([0, b - n])
+def unsent_text(seat_id):
+    return texts[seat_id][sent[seat_id]:]
+
+
+def history_chunk(region):
+    """송출되는 구간 글 → 송출 이력에 붙일 글. 어절 사이는 띄어쓰기 하나, 줄바꿈은 그대로 한 번."""
+    out = ""
+
+    def at_line_start():
+        tail = (history + out)[-1:]
+        return tail == "" or tail == "\n"
+
+    lead = re.match(r"\s*", region).group(0)
+    if "\n" in lead and not at_line_start():
+        out += "\n"
+    for m in re.finditer(r"(\S+)(\s*)", region):
+        out += m.group(1) if at_line_start() else " " + m.group(1)
+        if "\n" in m.group(2):
+            out += "\n"
     return out
 
 
-def clean_marks(raw, text):
-    """브라우저가 보낸 노란 줄 목록을 검사: [시작, 줄바꿈 위치]가 실제로 한 줄 전체여야 해요."""
-    out = set()
-    if not isinstance(raw, list):
-        return []
-    for m in raw[:500]:
-        try:
-            a, b = int(m[0]), int(m[1])
-        except (TypeError, ValueError, IndexError, KeyError):
-            continue
-        if 0 <= a < b < len(text) and text[b] == "\n" and "\n" not in text[a:b] and (a == 0 or text[a - 1] == "\n"):
-            out.add((a, b))
-    return [list(x) for x in sorted(out)]
-
-
-def cut_first_word(seat_id, kind):
-    """seat_id 칸의 첫 어절을 잘라내고 모두에게 알려요. (어절, 뒤가 줄바꿈인지) 또는 None.
-    kind: "send"(F1 송출) | "delete"(F8 삭제)"""
-    m = FIRST_WORD.match(texts[seat_id])
-    if not m:
-        return None
-    removed = m.group(0)  # 앞 공백 + 어절 + 뒤 공백(줄바꿈 포함)
-    texts[seat_id] = texts[seat_id][len(removed):]
-    marks[seat_id] = cut_marks(marks[seat_id], len(removed), kind)
+def trim_sent(seat_id):
+    """송출된 부분이 TRIM_AT 이상이면 앞쪽을 어절 경계에서 잘라내고 모두에게 알려요."""
+    S = sent[seat_id]
+    if S < TRIM_AT:
+        return
+    T = texts[seat_id]
+    k = S - TRIM_KEEP
+    while k < S and not T[k - 1].isspace():
+        k += 1
+    if k <= 0:
+        return
+    removed = T[:k]
+    texts[seat_id] = T[k:]
+    sent[seat_id] = S - k
     ext_ver[seat_id] += 1
     ops = ext_ops[seat_id]
-    ops.append((ext_ver[seat_id], removed, kind))
+    ops.append((ext_ver[seat_id], removed))
     del ops[:-OPS_KEEP]
     socketio.emit("cut", {
         "seat": seat_id,
         "removed": removed,
-        "kind": kind,
         "ext": ext_ver[seat_id],
         "text": texts[seat_id],
-        "marks": marks[seat_id],
+        "sent": sent[seat_id],
     })
-    return m.group(2), "\n" in m.group(3)
 
 
-def clear_box(seat_id):
-    """칸 내용·노란 줄·잘라내기 기록을 비우고 모두에게 알려요."""
+def clear_box(seat_id, skip_sid=None):
+    """칸 내용·송출 위치·노란 창·잘라내기 기록을 비우고 모두에게 알려요."""
     texts[seat_id] = ""
-    marks[seat_id] = []
+    sent[seat_id] = 0
     ext_ops[seat_id] = []
-    socketio.emit("text", {"seat": seat_id, "text": "", "marks": []})
+    seats[seat_id]["standby"] = False
+    socketio.emit("text", {"seat": seat_id, "text": "", "sent": 0, "ext": ext_ver[seat_id], "reset": True},
+                  skip_sid=skip_sid)
 
 
 def texts_payload():
     return {
-        s["id"]: {"text": texts[s["id"]], "ext": ext_ver[s["id"]], "marks": marks[s["id"]]}
+        s["id"]: {"text": texts[s["id"]], "ext": ext_ver[s["id"]], "sent": sent[s["id"]]}
         for s in workers_in_order()
     }
 
@@ -284,20 +338,23 @@ def on_join(data):
             s["joined_at"] = time.time()
             s["role"] = "worker" if worker_count() < MAX_WORKERS else "spectator"
             texts[seat_id] = ""
-            marks[seat_id] = []
+            sent[seat_id] = 0
             ext_ops[seat_id] = []
             ensure_main()
         sid_to_seat[request.sid] = seat_id
+        payload_name = s["name"]
         payload = {
             "seat": seat_id,
             "token": s["token"],
             "texts": texts_payload(),
             # 재연결(새로고침 아님) 시 끊긴 동안 친 글을 살리면서 놓친 잘라내기를 적용하려고 보내요
-            "my_ops": [[v, r, k] for v, r, k in ext_ops[seat_id]],
+            "my_ops": [[v, r] for v, r in ext_ops[seat_id]],
             "history": history,
+            "video": video_msg(),
         }
 
     emit("joined", payload)
+    emit("snippets", snippets_payload(payload_name))
     broadcast()
 
 
@@ -317,6 +374,9 @@ def on_rename(data):
         if s["token"] is not None and not mine:
             return emit("toast", {"message": "다른 사람이 쓰고 있는 자리는 이름을 바꿀 수 없어요."})
         s["name"] = name
+        sid = s["sid"] if mine else None
+    if sid:
+        socketio.emit("snippets", snippets_payload(name), to=sid)  # 이름이 바뀌면 그 이름의 상용구로
     broadcast()
 
 
@@ -353,13 +413,12 @@ def on_disconnect(*_args):
 
 @socketio.on("text")
 def on_text(data):
-    """작업자가 자기 칸 전체 글을 보내요. {text, ext: 작업자가 알고 있는 잘라내기 버전, marks: 노란 줄}"""
+    """작업자가 자기 칸 전체 글을 보내요. {text, ext: 작업자가 알고 있는 잘라내기 버전}"""
     data = data or {}
     text = data.get("text")
     if not isinstance(text, str):
         return
     text = text[:TEXT_MAX]
-    ms = data.get("marks") if isinstance(data.get("marks"), list) else []
     try:
         known = int(data.get("ext", 0))
     except (TypeError, ValueError):
@@ -369,14 +428,42 @@ def on_text(data):
         if not is_worker(seat_id):
             return
         if known < ext_ver[seat_id]:
-            # 작업자가 아직 모르는 잘라내기(F1/F8)를 그 글과 노란 줄에도 똑같이 적용
-            for ver, removed, kind in ext_ops[seat_id]:
+            # 작업자가 아직 모르는 정리(앞부분 잘라내기)를 그 글에도 똑같이 적용
+            for ver, removed in ext_ops[seat_id]:
                 if ver > known and text.startswith(removed):
                     text = text[len(removed):]
-                    ms = cut_marks(clean_marks(ms, removed + text), len(removed), kind)
+        prefix = texts[seat_id][:sent[seat_id]]
+        if not text.startswith(prefix):
+            # 송출된 부분이 바뀐 글 → 받지 않고 주인 브라우저를 서버 글로 맞춰요 (정상이라면 일어나지 않아요)
+            return emit("resync", {"text": texts[seat_id], "sent": sent[seat_id], "ext": ext_ver[seat_id]})
         texts[seat_id] = text
-        marks[seat_id] = clean_marks(ms, text)
-        socketio.emit("text", {"seat": seat_id, "text": text, "marks": marks[seat_id]}, skip_sid=request.sid)
+        socketio.emit("text", {"seat": seat_id, "text": text, "sent": sent[seat_id], "ext": ext_ver[seat_id]},
+                      skip_sid=request.sid)
+
+
+@socketio.on("standby")
+def on_standby():
+    """대기 작업자가 자기 칸에서 Enter → 칸 전체가 노란 창 (이어받을 준비 됐다는 신호)."""
+    with lock:
+        seat_id = my_seat()
+        if not is_worker(seat_id) or seat_id == main_seat or seats[seat_id]["standby"]:
+            return
+        seats[seat_id]["standby"] = True
+    broadcast()
+
+
+@socketio.on("clear_mine")
+def on_clear_mine():
+    """F12: 내 칸 전체 지우기 + 송출 위치 초기화 + 노란 창 끄기. 응답: {ok, ext}"""
+    with lock:
+        seat_id = my_seat()
+        if not is_worker(seat_id):
+            return {"ok": False}
+        ext_ver[seat_id] += 1  # 그 전에 보낸 정리(잘라내기)는 지운 칸에 적용하지 않게
+        clear_box(seat_id, skip_sid=request.sid)  # 주인 칸은 이미 비웠어요 (그 뒤 친 글을 지우지 않게)
+        ext = ext_ver[seat_id]
+    broadcast()
+    return {"ok": True, "ext": ext}
 
 
 @socketio.on("pass_turn")
@@ -431,7 +518,7 @@ def on_swap(data):
             return  # 초록불이 꺼진 칩(또는 이미 바뀐 자리) → 아무 일 없음
         if not t["online"]:
             return emit("toast", {"message": f"{t['name']}님이 연결 끊김 상태라 바꿀 수 없어요."})
-        if texts[me_id].strip() and not confirm:
+        if unsent_text(me_id).strip() and not confirm:
             return emit("swap_confirm", {"target": target})
 
         w = seats[me_id]
@@ -452,28 +539,55 @@ def on_swap(data):
 
 # ---------- 실시간 이벤트: 송출 / 상대 칸 삭제 / 이력 ----------
 
-@socketio.on("send_word")
-def on_send_word():
-    """F1: 턴 주인의 칸에서 첫 어절을 잘라 송출 이력에 이어 붙여요."""
+@socketio.on("send_upto")
+def on_send_upto(data):
+    """작성중 작업자의 칸에서 [sent, offset) 구간을 송출해요. {offset, ext}
+    자동 송출(완성 어절 3개 → 맨 앞 1개), F1(첫 어절), Insert(남은 글 전부)가 모두 이걸 써요.
+    응답: {ok, sent, ext, message?} — sent/ext는 서버 기준 최신 값"""
     global history
+    data = data or {}
+    try:
+        offset = int(data.get("offset"))
+        known = int(data.get("ext", 0))
+    except (TypeError, ValueError):
+        return {"ok": False, "sent": 0, "ext": 0}
     with lock:
         seat_id = my_seat()
-        if not is_worker(seat_id) or seat_id != main_seat:
-            return emit("toast", {"message": "작성중인 작업자만 송출할 수 있어요. (지금은 대기중)"})
-        cut = cut_first_word(seat_id, "send")
-        if cut is None:
-            return emit("toast", {"message": "송출할 내용이 없어요."})
-        word, newline = cut
-        chunk = word if (history == "" or history.endswith("\n")) else " " + word
-        if newline:
-            chunk += "\n"
-        history += chunk
-        socketio.emit("history_append", {"chunk": chunk})
+        if not is_worker(seat_id):
+            return {"ok": False, "sent": 0, "ext": 0, "message": "작업자만 송출할 수 있어요."}
+
+        def result(ok, message=None):
+            r = {"ok": ok, "sent": sent[seat_id], "ext": ext_ver[seat_id]}
+            if message:
+                r["message"] = message
+            return r
+
+        if seat_id != main_seat:
+            return result(False, "작성중인 작업자만 송출할 수 있어요. (지금은 대기중)")
+        if known < ext_ver[seat_id]:
+            # 옛 버전 기준 위치 → 그 뒤 정리로 잘린 만큼 당겨서 해석
+            ops = [r for v, r in ext_ops[seat_id] if v > known]
+            if len(ops) != ext_ver[seat_id] - known:
+                return result(False)
+            offset -= sum(len(r) for r in ops)
+        S, T = sent[seat_id], texts[seat_id]
+        if offset <= S:
+            return result(True)  # 이미 송출됨 (같은 요청이 두 번 와도 한 번만)
+        if offset > len(T) or not (offset == len(T) or T[offset - 1].isspace()):
+            return result(False)
+        chunk = history_chunk(T[S:offset])
+        sent[seat_id] = offset
+        if chunk:
+            history += chunk
+            socketio.emit("history_append", {"chunk": chunk})
+        socketio.emit("sent", {"seat": seat_id, "sent": offset, "ext": ext_ver[seat_id]}, skip_sid=request.sid)
+        trim_sent(seat_id)
+        return result(True)
 
 
 @socketio.on("delete_partner_word")
 def on_delete_partner_word():
-    """F8: 상대 작업자 칸의 첫 어절을 지워요."""
+    """F8: 상대 작업자 칸의 '송출 안 된 첫 어절'을 지워요. 상대 브라우저가 직접 지우도록 전달."""
     with lock:
         seat_id = my_seat()
         if not is_worker(seat_id):
@@ -481,8 +595,79 @@ def on_delete_partner_word():
         other = other_worker(seat_id)
         if other is None:
             return emit("toast", {"message": "상대 작업자가 없어요."})
-        if cut_first_word(other, "delete") is None:
-            return emit("toast", {"message": "상대 칸에 지울 내용이 없어요."})
+        if not FIRST_WORD.match(unsent_text(other)):
+            return emit("toast", {"message": "상대 칸에 지울 내용이 없어요. (송출된 글은 지울 수 없어요)"})
+        other_sid = seats[other]["sid"]
+        if not other_sid:
+            return emit("toast", {"message": "상대가 연결 끊김 상태라 지울 수 없어요."})
+    socketio.emit("delete_first", {}, to=other_sid)
+
+
+# ---------- 실시간 이벤트: 영상 같이 보기 ----------
+# video = {"id": 영상ID, "playing": 재생중?, "pos": 기준 시간(초), "at": 기준 시각(서버 time.time())}
+# 지금 위치 = playing이면 pos + (지금 - at), 아니면 pos. 나중에 들어온 사람도 이걸로 현재 위치부터 봐요.
+video = None
+YT_ID = re.compile(r"^[\w-]{11}$")
+
+
+def video_msg(by=None):
+    return {"video": dict(video) if video else None, "now": time.time(), "by": by}
+
+
+@socketio.on("clock")
+def on_clock():
+    """브라우저가 서버 시계와의 차이를 재요 (영상 위치 계산용)."""
+    return {"now": time.time()}
+
+
+def _clean_pos(raw):
+    try:
+        pos = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if pos != pos or pos < 0:  # NaN / 음수
+        return 0.0
+    return min(pos, 7 * 24 * 3600.0)
+
+
+@socketio.on("video_open")
+def on_video_open(data):
+    """작업자가 유튜브 영상을 열어요 → 모두의 화면에 같은 영상이 재생돼요. {id, start}"""
+    global video
+    data = data or {}
+    vid = data.get("id")
+    start = _clean_pos(data.get("start", 0)) or 0.0
+    if not isinstance(vid, str) or not YT_ID.match(vid):
+        return emit("toast", {"message": "유튜브 영상 ID가 잘못됐어요."})
+    with lock:
+        seat_id = my_seat()
+        if not is_worker(seat_id):
+            return emit("toast", {"message": "영상은 작업자만 열 수 있어요."})
+        video = {"id": vid, "playing": True, "pos": start, "at": time.time()}
+        msg = video_msg(seats[seat_id]["name"])
+    socketio.emit("video", msg)
+
+
+@socketio.on("video_ctrl")
+def on_video_ctrl(data):
+    """작업자의 재생/일시정지/시간 이동 → 모두에게. {action: play|pause|seek, pos: 그 순간 영상 시간}"""
+    data = data or {}
+    action = data.get("action")
+    pos = _clean_pos(data.get("pos"))
+    if action not in ("play", "pause", "seek") or pos is None:
+        return
+    with lock:
+        seat_id = my_seat()
+        if not is_worker(seat_id):
+            return emit("toast", {"message": "영상 조작은 작업자만 할 수 있어요."})
+        if video is None:
+            return
+        if action != "seek":
+            video["playing"] = action == "play"
+        video["pos"] = pos
+        video["at"] = time.time()
+        msg = video_msg(seats[seat_id]["name"])
+    socketio.emit("video", msg)
 
 
 @socketio.on("clear_history")
@@ -494,6 +679,94 @@ def on_clear_history():
         history = ""
         socketio.emit("history_full", {"history": ""})
     emit("toast", {"message": "송출 이력을 초기화했어요."})
+
+
+# ---------- 실시간 이벤트: 상용구 (작업자 이름별) ----------
+# 이름은 브라우저가 보낸 값이 아니라 "지금 이 연결이 앉은 자리의 이름"을 써요 → 다른 작업자 것과 섞이지 않아요.
+
+def snippets_payload(name):
+    with snip_lock:
+        return {"name": name, "items": dict(snippets.get(name, {}))}
+
+
+def my_name():
+    with lock:
+        seat_id = my_seat()
+        return None if seat_id is None else seats[seat_id]["name"]
+
+
+def push_snippets(name):
+    """같은 이름으로 앉아 있는 모든 연결(다른 탭 포함)에 최신 목록을 보내요."""
+    payload = snippets_payload(name)
+    with lock:
+        sids = [s["sid"] for s in seats if s["token"] and s["sid"] and s["name"] == name]
+    for sid in sids:
+        socketio.emit("snippets", payload, to=sid)
+
+
+@socketio.on("snippets_get")
+def on_snippets_get():
+    name = my_name()
+    if name is not None:
+        emit("snippets", snippets_payload(name))
+
+
+@socketio.on("snippet_set")
+def on_snippet_set(data):
+    """{key, out} — 입력어/출력어는 앞뒤 공백만 떼고 그대로 저장. 응답: {ok, key, out, replaced} 또는 {ok: False, message}"""
+    data = data or {}
+    key, out = data.get("key"), data.get("out")
+    if not isinstance(key, str) or not isinstance(out, str):
+        return {"ok": False, "message": "잘못된 상용구예요."}
+    key, out = key.strip(), out.strip()
+    if not key or not out or any(c.isspace() for c in key):
+        return {"ok": False, "message": "입력어(띄어쓰기 없이)와 출력어를 모두 써주세요."}
+    if len(key) > SNIP_KEY_MAX or len(out) > SNIP_OUT_MAX:
+        return {"ok": False, "message": f"너무 길어요. (입력어 {SNIP_KEY_MAX}자, 출력어 {SNIP_OUT_MAX}자까지)"}
+    name = my_name()
+    if name is None:
+        return {"ok": False, "message": "입장한 뒤에 등록할 수 있어요."}
+    with snip_lock:
+        mine = snippets.setdefault(name, {})
+        if key not in mine and len(mine) >= SNIP_PER_USER:
+            return {"ok": False, "message": f"상용구는 {SNIP_PER_USER}개까지 등록할 수 있어요."}
+        prev = mine.get(key)
+        mine[key] = out
+        try:
+            _save_snippets()
+        except OSError as e:
+            if prev is None:
+                mine.pop(key, None)
+            else:
+                mine[key] = prev
+            print(f"[snippets] 저장 실패: {e}", flush=True)
+            return {"ok": False, "message": "서버에 상용구를 저장하지 못했어요."}
+    push_snippets(name)
+    return {"ok": True, "key": key, "out": out, "replaced": prev is not None and prev != out}
+
+
+@socketio.on("snippet_del")
+def on_snippet_del(data):
+    data = data or {}
+    key = data.get("key")
+    name = my_name()
+    if not isinstance(key, str) or name is None:
+        return {"ok": False, "message": "삭제할 수 없어요."}
+    with snip_lock:
+        mine = snippets.get(name, {})
+        if key not in mine:
+            return {"ok": True, "key": key}
+        prev = mine.pop(key)
+        if not mine:
+            snippets.pop(name, None)
+        try:
+            _save_snippets()
+        except OSError as e:
+            snippets.setdefault(name, {})[key] = prev
+            print(f"[snippets] 저장 실패: {e}", flush=True)
+            return {"ok": False, "message": "서버에 상용구를 저장하지 못했어요."}
+    push_snippets(name)
+    return {"ok": True, "key": key}
 
 
 if __name__ == "__main__":

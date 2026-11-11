@@ -1,4 +1,4 @@
-// 실시간 방송 자막 — 화면 로직 (입장 / 입력 공유 / 턴 / 송출 이력 / 단축키)
+// 실시간 방송 자막 — 화면 로직 (입장 / 입력 공유 / 턴 / 자동 송출 / 단축키)
 const socket = io();
 const STORE_KEY = "live_me";
 
@@ -10,12 +10,16 @@ let editingSeat = null;    // 메인 화면에서 이름 수정 중인 자리
 // 입력칸 / 송출 이력
 const boxes = new Map();   // 자리 번호 → textarea (한 번 만들면 계속 재사용 → 커서·조합 유지)
 const texts = {};          // 자리 번호 → 서버가 알려준 글 (상대·관전용 표시)
-let myExt = 0;             // 내 칸에 대해 서버가 잘라낸 버전 중 내가 반영한 마지막 번호
-let pendingOps = [];       // 한글 조합 중이라 아직 반영 못 한 잘라내기
+const sents = {};          // 자리 번호 → 서버가 알려준 송출 위치 (앞에서 몇 글자가 송출됐는지)
+const exts = {};           // 자리 번호 → 서버가 알려준 정리(잘라내기) 버전
+let myExt = 0;             // 내 칸에 대해 서버가 정리한 버전 중 내가 반영한 마지막 번호
+let mySent = 0;            // 내 칸의 송출 위치 (송출 요청을 보낸 곳까지 — 이 앞은 고칠 수 없음)
+let pendingOps = [];       // 한글 조합 중이라 아직 반영 못 한 정리(앞부분 잘라내기)
+let afterIme = [];         // 한글 조합이 끝나면 할 일 (상대의 F8 삭제 등)
+let clearPending = false;  // F12 직후 서버 확인 전 — 그 전에 온 정리는 지운 칸에 적용 안 함
 let composing = false;     // 내 칸에서 한글 조합 중인지
 let historyText = "";
-const marks = {};          // 자리 번호 → 노란 줄 [[줄 시작, 그 줄의 \n 위치], ...]
-let lastValue = "";        // 마지막으로 노란 줄 위치를 맞춘 시점의 내 칸 글
+let lastValue = "";        // 마지막으로 서버에 보낸(= 송출된 부분이 온전한) 내 칸 글
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -51,14 +55,21 @@ const partnerSeat = () => {
   return p ? p.id : null;
 };
 
+function clearObj(o) { for (const k of Object.keys(o)) delete o[k]; }
+
 function resetRoomLocal() {
   boxes.clear();
-  for (const k of Object.keys(texts)) delete texts[k];
-  for (const k of Object.keys(marks)) delete marks[k];
+  clearObj(texts); clearObj(sents); clearObj(exts);
   lastValue = "";
   myExt = 0;
+  mySent = 0;
   pendingOps = [];
+  afterIme = [];
+  clearPending = false;
   composing = false;
+  reinsertGuard = null;
+  phrases = Object.create(null);
+  phraseOwner = null;
   for (let i = 0; i < 2; i++) { const el = $(`writer-${i}`); if (el) { delete el.dataset.seat; el.innerHTML = ""; } }
 }
 
@@ -74,158 +85,285 @@ socket.on("joined", (d) => {
   saveMe({ seat: d.seat, token: d.token });
   joined = true;
 
-  const myLocalMarks = marks[d.seat];
-  for (const k of Object.keys(texts)) delete texts[k];
-  for (const k of Object.keys(marks)) delete marks[k];
-  for (const [seat, t] of Object.entries(d.texts || {})) { texts[seat] = t.text; marks[seat] = t.marks || []; }
+  clearObj(texts); clearObj(sents); clearObj(exts);
+  for (const [seat, t] of Object.entries(d.texts || {})) { texts[seat] = t.text; sents[seat] = t.sent || 0; exts[seat] = t.ext || 0; }
   const mine = (d.texts || {})[d.seat];
+  clearPending = false;
   if (mine && localBox) {
-    // 끊긴 동안 친 글·노란 줄은 살리고, 그동안 서버가 잘라낸 것(F1/F8)만 똑같이 반영
-    marks[d.seat] = myLocalMarks || [];
-    pendingOps = (d.my_ops || []).map(([ext, removed, kind]) => ({ ext, removed, kind, text: mine.text, marks: mine.marks || [] }));
+    // 끊긴 동안 친 글은 살리고, 그동안 서버가 정리한 것만 똑같이 반영한 뒤 서버로 다시 보내요
+    pendingOps = (d.my_ops || []).map(([ext, removed]) => ({ ext, removed, text: mine.text, sent: mine.sent }));
     applyPendingOps(true);
     myExt = Math.max(myExt, mine.ext);
+    if (mySent > mine.sent) {
+      // 끊기기 직전에 보낸 송출 요청이 서버에 닿지 않았음 → 다시 요청 (턴이 없으면 서버가 거절 → 원래대로)
+      const want = mySent;
+      mySent = mine.sent;
+      requestSend(want);
+    } else {
+      mySent = mine.sent;
+    }
+    paintBox(d.seat);
   } else if (mine) {
-    myExt = mine.ext; // 새로고침 → 서버에 남아 있던 글·노란 줄로 칸을 채워요 (render에서)
+    myExt = mine.ext; // 새로고침 → 서버에 남아 있던 글·송출 위치로 칸을 채워요 (render → getBox에서)
+    mySent = mine.sent;
   }
   for (const [seat, ta] of boxes) if (Number(seat) !== d.seat) setBoxText(ta, texts[seat] || "");
 
   setHistory(d.history || "");
   render();
+  applyVideo(d.video);
 });
 socket.on("join_error", (d) => {
-  if (d.clear) { saveMe(null); joined = false; resetRoomLocal(); }
+  if (d.clear) { saveMe(null); joined = false; resetRoomLocal(); teardownVideo(); }
   toast(d.message);
   render();
 });
-socket.on("left", () => { saveMe(null); joined = false; resetRoomLocal(); render(); });
+socket.on("left", () => { saveMe(null); joined = false; resetRoomLocal(); teardownVideo(); render(); });
 socket.on("toast", (d) => toast(d.message));
+
+const isMyLiveBox = (seat) => joined && me && seat === me.seat && myBox();
 
 // 다른 작업자가 입력한 글 (자기 칸 글은 서버가 나에게 다시 보내지 않아요)
 socket.on("text", (d) => {
-  if (joined && me && d.seat === me.seat) return;
+  if (isMyLiveBox(d.seat)) {
+    if (!d.reset) return;
+    // 서버가 내 칸을 비움 (자리 교체 등)
+    setMyValue(myBox(), "", 0);
+    mySent = 0;
+    myExt = d.ext || myExt;
+    pendingOps = [];
+    lastValue = "";
+    paintBox(me.seat);
+    return;
+  }
   texts[d.seat] = d.text;
-  marks[d.seat] = d.marks || [];
+  sents[d.seat] = d.sent || 0;
+  if (d.ext != null) exts[d.seat] = d.ext;
   const ta = boxes.get(d.seat);
   if (ta) setBoxText(ta, d.text);
 });
 
-// 서버가 어떤 칸의 첫 어절을 잘라냄 (F1 송출 또는 F8 삭제)
+// 다른 작업자 칸의 송출 위치가 옮겨짐 (파란 배경만 다시 그림)
+socket.on("sent", (d) => {
+  if (isMyLiveBox(d.seat)) return;
+  sents[d.seat] = d.sent || 0;
+  paintBox(d.seat);
+});
+
+// 서버가 어떤 칸의 송출된 앞부분을 정리함 (길어져서)
 socket.on("cut", (d) => {
-  if (joined && me && d.seat === me.seat && myBox()) {
+  if (isMyLiveBox(d.seat)) {
+    if (clearPending) return; // F12로 지우기 전 글에 대한 정리 → 무시
     pendingOps.push(d);
     if (!composing) applyPendingOps();
     return;
   }
   texts[d.seat] = d.text;
-  marks[d.seat] = d.marks || [];
+  sents[d.seat] = d.sent || 0;
+  exts[d.seat] = d.ext;
   const ta = boxes.get(d.seat);
   if (ta) setBoxText(ta, d.text);
 });
+
+// 내 칸 글이 서버와 어긋남 (송출된 부분이 바뀐 글을 보냄) → 서버 글로 맞춤
+socket.on("resync", (d) => {
+  const ta = myBox();
+  if (!ta) return;
+  pendingOps = [];
+  myExt = d.ext;
+  mySent = d.sent;
+  setMyValue(ta, d.text, d.text.length);
+  lastValue = d.text;
+  paintBox(me.seat);
+});
+
+// 상대 작업자가 F8 → 내 칸의 "송출 안 된 첫 어절"을 지움
+socket.on("delete_first", () => whenImeIdle(deleteFirstUnsent));
 
 socket.on("history_append", (d) => appendHistory(d.chunk));
 socket.on("history_full", (d) => setHistory(d.history || ""));
 
 // ---------- 입력칸 ----------
-// 내 칸 글이 바뀔 때마다 호출: 노란 줄 위치를 맞추고 서버로 보내요.
-// lineBreak=true → 방금 Enter로 끝낸 줄을 노란 줄로 표시 (턴이 없을 때만 호출됨)
-function emitText(lineBreak = false) {
+// 내 칸 글이 바뀔 때마다 호출: 서버로 보내고, 작성중이면 자동 송출을 확인해요.
+function emitText() {
   const ta = myBox();
   if (!ta) return;
-  const seat = me.seat;
   const v = ta.value;
-  let ms = marks[seat] || [];
-  if (v !== lastValue) {
-    const caret = ta.selectionStart === ta.selectionEnd ? ta.selectionStart : null;
-    ms = shiftMarks(ms, lastValue, v, caret);
-    lastValue = v;
+  if (!v.startsWith(lastValue.slice(0, mySent))) {
+    // 송출된 부분이 바뀜 → 되돌리고(친 글자는 송출 안 된 부분 끝에 붙여서) 다시 보냄
+    if (!composing) repairSent(ta);
+    return;
   }
-  if (lineBreak === true) {
-    const k = ta.selectionStart - 1;          // 방금 들어간 줄바꿈 위치
-    if (v[k] === "\n") {
-      const a = k > 0 ? v.lastIndexOf("\n", k - 1) + 1 : 0;
-      if (v.slice(a, k).trim()) ms = ms.concat([[a, k]]);
-    }
-  }
-  marks[seat] = validMarks(ms, v);
-  paintMarks(seat);
-  socket.emit("text", { text: v, ext: myExt, marks: marks[seat] });
+  lastValue = v;
+  paintBox(me.seat);
+  socket.emit("text", { text: v, ext: myExt });
+  maybeAutoSend();
 }
 
 function onMyInput(e) {
-  emitText(e.inputType === "insertLineBreak" && !amMain());
+  const ta = e.currentTarget;
+  if (!e.isComposing && checkReinsert(ta)) return;
+  emitText();
+  // 대기중 작업자가 Enter → 내 칸 전체가 노란 창 (이어받을 준비 신호)
+  if (e.inputType === "insertLineBreak" && amWorker() && !amMain() && !(myInfo() || {}).standby) {
+    socket.emit("standby");
+  }
 }
 
-// ---------- 노란 줄 위치 계산 ----------
-// 글이 oldV → newV로 바뀌었을 때: 바뀐 곳이 노란 줄을 건드렸으면 표시를 없애고, 뒤쪽 줄은 위치만 옮겨요.
-// caret(바뀐 뒤 커서)을 쓰면 "같은 글자가 반복될 때 어디가 바뀐 건지"를 정확히 알 수 있어요.
-function shiftMarks(ms, oldV, newV, caret) {
-  if (!ms.length) return ms;
-  let p = 0, s = -1;
-  if (caret != null) {
-    const tail = newV.length - caret;
-    if (tail <= oldV.length && oldV.endsWith(newV.slice(caret))) s = tail;
-  }
-  if (s >= 0) {
-    const maxP = Math.min(oldV.length, newV.length) - s;
-    while (p < maxP && oldV[p] === newV[p]) p++;
-  } else {
-    const max = Math.min(oldV.length, newV.length);
-    while (p < max && oldV[p] === newV[p]) p++;
-    s = 0;
-    while (s < max - p && oldV[oldV.length - 1 - s] === newV[newV.length - 1 - s]) s++;
-  }
-  const oldEnd = oldV.length - s;             // 예전 글에서 바뀐 구간 [p, oldEnd)
-  const delta = newV.length - oldV.length;
-  const out = [];
-  for (const [a, b] of ms) {
-    const touched = p === oldEnd
-      ? a <= p && p <= b                      // 끼워 넣기: 줄 맨 앞~줄 끝(\n 앞) 사이면 수정
-      : p <= b && oldEnd >= a;                // 지우기/바꾸기: 줄 또는 앞뒤 줄바꿈과 겹치면 수정
-    if (touched) continue;
-    out.push(b < p ? [a, b] : [a + delta, b + delta]);
-  }
-  return out;
+// 내 칸 글을 코드로 바꿀 때 (스크롤 유지, 커서 위치 지정)
+function setMyValue(ta, value, cursor) {
+  const top = ta.scrollTop;
+  ta.value = value;
+  const c = Math.min(cursor, value.length);
+  ta.setSelectionRange(c, c);
+  ta.scrollTop = top;
 }
 
-// 앞에서 n글자를 잘라냈을 때 (서버 app.py의 cut_marks와 같은 규칙)
-function cutMarks(ms, n, kind) {
-  const out = [];
-  for (const [a, b] of ms || []) {
-    if (a >= n) out.push([a - n, b - n]);
-    else if (kind === "send" && n < b) out.push([0, b - n]); // 송출로 앞부분만 나간 줄은 남은 부분 유지
+// ---------- 송출된 부분 보호 ----------
+// 송출된 부분 앞/안에 커서를 두고 치면 → 커서를 송출 안 된 부분 끝으로 옮긴 뒤 그 자리에 입력돼요.
+// Backspace/Delete가 송출된 글자를 건드리면 → 무시. (붙여넣기·잘라내기 등 나머지는 repairSent가 되돌려요)
+function guardSentKeydown(e, ta) {
+  if (!mySent || e.ctrlKey || e.metaKey || e.altKey) return;
+  const s = ta.selectionStart, en = ta.selectionEnd;
+  if (s >= mySent) return;
+  const k = e.key;
+  if (k === "Backspace" || k === "Delete") {
+    if (en > mySent && s !== en) ta.setSelectionRange(mySent, en); // 송출 안 된 부분만 지움
+    else e.preventDefault();
+    return;
   }
-  return out;
+  const typing = k === "Enter" || k === "Process" || e.keyCode === 229 || (k && k.length === 1);
+  if (!typing) return; // 화살표·Home 등 이동은 그대로
+  if (en > mySent) ta.setSelectionRange(mySent, en);
+  else ta.setSelectionRange(ta.value.length, ta.value.length);
+}
+// Backspace는 커서가 송출 위치 "바로 뒤"여도 송출된 글자를 지우므로 따로 확인
+function guardBackspaceAtEdge(e, ta) {
+  if (!mySent || e.key !== "Backspace") return;
+  const s = ta.selectionStart, en = ta.selectionEnd;
+  if (s === en && s === mySent) e.preventDefault();
 }
 
-function validMarks(ms, v) {
-  const seen = new Set();
-  return (ms || []).filter(([a, b]) => {
-    const ok = 0 <= a && a < b && b < v.length && v[b] === "\n" && (a === 0 || v[a - 1] === "\n")
-      && !v.slice(a, b).includes("\n") && !seen.has(a);
-    if (ok) seen.add(a);
-    return ok;
-  }).sort((x, y) => x[0] - y[0]);
+// 송출된 부분이 바뀐 경우: 바뀌기 전 글로 되돌리고, 새로 들어온 글자는 송출 안 된 부분 끝에 붙여요.
+function repairSent(ta) {
+  const oldV = lastValue, v = ta.value;
+  let p = 0;
+  const max = Math.min(oldV.length, v.length);
+  while (p < max && oldV[p] === v[p]) p++;
+  let sfx = 0;
+  while (sfx < max - p && oldV[oldV.length - 1 - sfx] === v[v.length - 1 - sfx]) sfx++;
+  const inserted = v.slice(p, v.length - sfx);
+  const fixed = oldV + inserted;
+  setMyValue(ta, fixed, fixed.length);
+  if (ta.value.startsWith(oldV.slice(0, mySent))) emitText();
 }
 
-// textarea 뒤 배경 레이어에 노란 줄을 그려요 (글꼴·줄간격·패딩·폭·스크롤을 textarea와 똑같이)
-function paintMarks(seat) {
+// ---------- 자동 송출 / 송출 요청 ----------
+// 상용구 등록 줄(입력어:출력어)을 치는 중이면 그 줄은 자동 송출하지 않아요 (F10 전에 송출되면 안 되니까).
+const PHRASE_LINE = /^\s*[^:：\s]+\s*[:：]/;
+
+// 작성중일 때, 송출 안 된 "완성 어절"(뒤에 공백·줄바꿈이 있는 어절)이 3개 이상이면
+// 뒤쪽 2개만 남기고 앞에서부터 송출해요. 지금 치고 있는 마지막 어절(뒤에 공백 없음)은 세지 않아요.
+function maybeAutoSend() {
+  const ta = myBox();
+  if (!ta || !amMain() || !socket.connected || clearPending) return;
+  const v = ta.value;
+  let limit = v.length;
+  // 커서가 있는 줄이 상용구 등록 줄이면 그 줄 앞까지만 셈
+  const caret = ta.selectionStart;
+  const lineStart = v.lastIndexOf("\n", caret - 1) + 1;
+  let lineEnd = v.indexOf("\n", caret);
+  if (lineEnd === -1) lineEnd = v.length;
+  if (lineStart >= mySent && PHRASE_LINE.test(v.slice(lineStart, lineEnd))) limit = lineStart;
+
+  const unsent = v.slice(mySent, limit);
+  const ends = [];
+  const re = /\S+\s+/g;
+  let m;
+  while ((m = re.exec(unsent))) ends.push(m.index + m[0].length);
+  // limit에서 끊었으면 마지막 매치의 공백이 줄 경계라 완성 어절이 맞아요
+  if (ends.length >= 3) requestSend(mySent + ends[ends.length - 3]);
+}
+
+// F1: 송출 안 된 첫 어절(치고 있던 어절이어도)을 바로 송출
+function sendFirstWord(ta) {
+  const m = /^\s*\S+\s*/.exec(ta.value.slice(mySent));
+  if (!m) return toast("송출할 내용이 없어요.");
+  requestSend(mySent + m[0].length);
+}
+
+// 서버에 "여기까지 송출" 요청. 바로 파랗게 칠하고(고칠 수 없게), 서버 응답으로 확정·보정해요.
+function requestSend(offset) {
+  const ta = myBox();
+  if (!ta || offset <= mySent || offset > ta.value.length) return;
+  mySent = offset;
+  paintBox(me.seat);
+  socket.timeout(5000).emit("send_upto", { offset, ext: myExt }, (err, res) => {
+    if (err || !res || myBox() !== ta) return; // 응답이 없으면 재연결 때 다시 맞춰요
+    // 서버 기준 위치 → 내 칸 기준 (아직 반영 못 한 정리만큼 더해서)
+    let conv = res.sent;
+    for (const op of pendingOps) if (op.ext > myExt && op.ext <= res.ext) conv += op.removed.length;
+    if (res.ext < myExt) return; // 그 뒤 정리를 이미 반영함 → 다른 응답/이벤트가 맞춰요
+    if (res.ok) mySent = Math.max(mySent, conv);
+    else {
+      mySent = Math.min(conv, ta.value.length);
+      if (res.message) toast(res.message);
+    }
+    paintBox(me.seat);
+    maybeAutoSend();
+  });
+}
+
+// 작성중 → 남은 송출 안 된 글(치고 있던 어절 포함)을 전부 송출한 뒤 턴 넘기기 (Insert / 버튼)
+function passTurn() {
+  if (!amMain()) return toast("작성중일 때만 턴을 넘길 수 있어요.");
+  if (!socket.connected) return toast("서버와 연결이 끊겨 있어요.");
+  const ta = myBox();
+  if (ta) {
+    emitText();
+    if (ta.value.slice(mySent).trim()) requestSend(ta.value.length);
+  }
+  socket.emit("pass_turn");
+}
+
+// 상대의 F8: 내 칸의 송출 안 된 첫 어절(앞뒤 공백 포함)을 지움
+function deleteFirstUnsent() {
+  const ta = myBox();
+  if (!ta) return;
+  const v = ta.value;
+  const m = /^\s*\S+\s*/.exec(v.slice(mySent));
+  if (!m) return;
+  const a = mySent, n = m[0].length;
+  const fix = (x) => (x <= a ? x : x >= a + n ? x - n : a);
+  const s = fix(ta.selectionStart), e = fix(ta.selectionEnd);
+  const top = ta.scrollTop;
+  ta.value = v.slice(0, a) + v.slice(a + n);
+  ta.setSelectionRange(s, e);
+  ta.scrollTop = top;
+  emitText();
+}
+
+// 한글 조합 중이면 조합이 끝난 뒤에 실행 (조합 중에 칸을 고치면 글자가 꼬여요)
+function whenImeIdle(fn) {
+  if (!composing) return fn();
+  afterIme.push(fn);
+}
+
+// ---------- 송출된 부분 표시 (파란 배경) ----------
+// textarea 뒤 배경 레이어에 같은 글을 투명하게 그리고, 송출된 부분만 배경색을 입혀요.
+function paintBox(seat) {
   const ta = boxes.get(Number(seat));
   if (!ta) return;
   const hl = ta.previousElementSibling;
   if (!hl || !hl.classList.contains("box-hl")) return;
-  const ms = marks[seat] || [];
-  if (!ms.length) {
+  const isMine = joined && me && Number(seat) === me.seat;
+  const v = ta.value;
+  const n = Math.min(isMine ? mySent : (sents[seat] || 0), v.length);
+  if (!n) {
     if (hl.firstChild) hl.textContent = "";
     return;
   }
-  const on = new Set(ms.map((m) => m[0]));
-  let html = "", pos = 0;
-  for (const line of ta.value.split("\n")) {
-    html += `<div class="hl-line${on.has(pos) ? " on" : ""}">${line ? esc(line) : "&#8203;"}</div>`;
-    pos += line.length + 1;
-  }
-  hl.innerHTML = html;
+  hl.innerHTML = `<span class="sent">${esc(v.slice(0, n))}</span>${esc(v.slice(n))}&#8203;`;
   if (ta.clientWidth) hl.style.width = ta.clientWidth + "px"; // 세로 스크롤바 폭을 빼서 줄바꿈 위치를 맞춤
   hl.scrollTop = ta.scrollTop;
 }
@@ -238,46 +376,40 @@ function setBoxText(ta, text) {
     ta.value = text;
     ta.scrollTop = stick ? ta.scrollHeight : top;
   }
-  paintMarks(ta.dataset.seat);
+  paintBox(ta.dataset.seat);
 }
 
-// 내 칸에 서버의 잘라내기를 반영 — 커서는 잘린 글자 수만큼 앞으로 당겨서 유지
+// 내 칸에 서버의 정리(송출된 앞부분 잘라내기)를 반영 — 커서·송출 위치는 잘린 만큼 앞으로
 function applyPendingOps(force = false) {
   const ta = myBox();
   if (!ta) { pendingOps = []; return; }
-  const ops = pendingOps.filter((op) => op.ext > myExt);
+  const ops = pendingOps.filter((op) => op.ext > myExt).sort((a, b) => a.ext - b.ext);
   pendingOps = [];
   if (!ops.length && !force) return;
 
-  // 먼저 지금까지 친 글 기준으로 노란 줄 위치를 맞춰 두고
-  if (ta.value !== lastValue) {
-    const caret = ta.selectionStart === ta.selectionEnd ? ta.selectionStart : null;
-    marks[me.seat] = shiftMarks(marks[me.seat] || [], lastValue, ta.value, caret);
-  }
   let val = ta.value;
-  let ms = marks[me.seat] || [];
   let s = ta.selectionStart, e = ta.selectionEnd;
   for (const op of ops) {
     const n = op.removed.length;
-    if (val.startsWith(op.removed)) {
+    if (val.startsWith(op.removed) && n <= mySent) {
       val = val.slice(n);
-      ms = cutMarks(ms, n, op.kind);
+      mySent -= n;
+      s = Math.max(0, s - n);
+      e = Math.max(0, e - n);
     } else {
       val = op.text; // 앞부분이 달라졌으면 서버 글을 따름
-      ms = op.marks || [];
+      mySent = op.sent;
+      s = e = val.length;
     }
-    s = Math.max(0, s - n);
-    e = Math.max(0, e - n);
     myExt = op.ext;
   }
   if (ops.length) {
-    const top = ta.scrollTop;
+    const before = ta.scrollHeight, top = ta.scrollTop;
     ta.value = val;
     ta.setSelectionRange(Math.min(s, val.length), Math.min(e, val.length));
-    ta.scrollTop = top;
+    ta.scrollTop = Math.max(0, top - (before - ta.scrollHeight)); // 앞이 잘린 만큼 스크롤도 당김
   }
-  marks[me.seat] = ms;
-  lastValue = ta.value; // 잘라내기는 위에서 정확히 반영했으니 다시 비교하지 않음
+  lastValue = ta.value;
   emitText(); // 서버와 최종 글을 맞춰요 (버전도 최신으로)
 }
 
@@ -288,7 +420,7 @@ function getBox(seatId, isMe) {
   ta.dataset.seat = seatId;
   ta.spellcheck = false;
   ta.value = texts[seatId] || "";
-  // 노란 줄은 textarea 뒤에 겹친 배경 레이어(div)에 그려요
+  // 송출된 부분 표시는 textarea 뒤에 겹친 배경 레이어(div)에 그려요
   const wrap = document.createElement("div");
   wrap.className = isMe ? "box-wrap" : "box-wrap ro";
   const hl = document.createElement("div");
@@ -296,17 +428,28 @@ function getBox(seatId, isMe) {
   hl.setAttribute("aria-hidden", "true");
   wrap.append(hl, ta);
   ta.addEventListener("scroll", () => { hl.scrollTop = ta.scrollTop; });
-  new ResizeObserver(() => paintMarks(seatId)).observe(ta);
+  new ResizeObserver(() => paintBox(seatId)).observe(ta);
   if (isMe) {
     lastValue = ta.value;
+    mySent = Math.min(sents[seatId] || 0, ta.value.length);
+    if (exts[seatId] != null) myExt = exts[seatId];
+    pendingOps = [];
     ta.placeholder = "여기에 입력하세요";
     ta.addEventListener("input", onMyInput);
     ta.addEventListener("keydown", onMyKeydown);
     ta.addEventListener("keyup", onMyKeyup);
     ta.addEventListener("compositionstart", () => { composing = true; });
-    ta.addEventListener("compositionend", () => {
+    ta.addEventListener("compositionend", (e) => {
       composing = false;
-      setTimeout(() => { if (!composing && pendingOps.length) applyPendingOps(); }, 0);
+      lastCommit = typeof e.data === "string" ? e.data : "";
+      setTimeout(() => {
+        if (composing) return;
+        if (pendingOps.length) applyPendingOps();
+        if (!checkReinsert(ta) && !ta.value.startsWith(lastValue.slice(0, mySent))) repairSent(ta);
+        const jobs = afterIme;
+        afterIme = [];
+        for (const fn of jobs) fn();
+      }, 0);
     });
   } else {
     ta.readOnly = true;
@@ -325,6 +468,8 @@ const KEYS = {
 const NO_REPEAT = new Set(["pass", "clearMine", "register", "expand"]); // 꾹 누르고 있어도 한 번만
 
 function onMyKeydown(e) {
+  guardSentKeydown(e, e.currentTarget);
+  guardBackspaceAtEdge(e, e.currentTarget);
   // 한글 조합 중엔 e.key가 "Process"일 수 있어서 물리 키(e.code)를 먼저 봐요
   const action = KEYS[e.code] || KEYS[e.key];
   if (!action) return;
@@ -335,31 +480,84 @@ function onMyKeydown(e) {
   if (e.repeat && NO_REPEAT.has(action)) return;
 
   const ta = e.currentTarget;
-  if (composing || e.isComposing || e.keyCode === 229) {
-    commitComposition(ta).then(() => runAction(action, ta));
-  } else {
-    runAction(action, ta);
-  }
+  const imeBusy = composing || e.isComposing || e.keyCode === 229;
+  if (!imeBusy && queuedKeys === 0) return runAction(action, ta);
+
+  // 한글 조합 중에 누른 단축키: 지금 value는 "확정 전" 글이라 여기서 칸을 고치면
+  // 조합 글자가 compositionend 때 다시 끼어들어요 (정:정상영 → 정상영영, 정 → 정정).
+  // 그래서 조합이 확정된 뒤(compositionend 이후 setTimeout 0) value를 다시 읽어서 처리해요.
+  // 앞서 미뤄둔 단축키가 있으면 순서를 지키려고 그 뒤에 줄을 세워요.
+  queuedKeys++;
+  keyQueue = keyQueue
+    .then(() => afterComposition(ta))
+    .then(() => {
+      if (myBox() !== ta) return; // 그 사이 자리가 바뀌었으면 버림
+      runAction(action, ta);
+      armReinsertGuard(ta);
+    })
+    .catch((err) => console.error(err))
+    .finally(() => { queuedKeys--; });
 }
 
-// 조합 중인 한글을 확정시켜요: 포커스를 잠깐 뺐다 돌려주면 크롬이 조합을 끝내요
-function commitComposition(ta) {
+let keyQueue = Promise.resolve();
+let queuedKeys = 0;        // 조합 확정을 기다리는 단축키 수
+let lastCommit = "";       // 마지막 compositionend의 확정 글자
+
+// 조합이 끝나고 브라우저가 확정 글자를 칸에 넣은 뒤에 resolve.
+// - 이미 조합이 끝났으면 setTimeout 0 한 번만 기다려요 (keyCode 229인데 compositionend가 먼저 온 경우).
+// - 그 사이 새 조합이 시작되면 그 조합의 compositionend까지 기다려요.
+// - compositionend가 끝내 오지 않으면(일부 IME) 포커스를 뺐다 돌려서 확정시키고, 그래도 안 되면 진행.
+function afterComposition(ta) {
   return new Promise((resolve) => {
     let done = false;
-    const finish = () => {
+    const cleanup = () => {
+      ta.removeEventListener("compositionend", settle);
+      clearTimeout(forceTimer);
+      clearTimeout(giveUpTimer);
+    };
+    function settle() {
+      setTimeout(() => {
+        if (done || composing) return;
+        done = true;
+        cleanup();
+        resolve();
+      }, 0);
+    }
+    ta.addEventListener("compositionend", settle);
+    const forceTimer = setTimeout(() => {
+      if (!done && composing) { ta.blur(); ta.focus(); }
+    }, 400);
+    const giveUpTimer = setTimeout(() => {
       if (done) return;
       done = true;
-      ta.removeEventListener("compositionend", onEnd);
+      cleanup();
       composing = false;
       if (pendingOps.length) applyPendingOps();
       resolve();
-    };
-    const onEnd = () => setTimeout(finish, 0);
-    ta.addEventListener("compositionend", onEnd);
-    ta.blur();
-    ta.focus();
-    setTimeout(finish, 60); // compositionend가 안 오더라도 계속 진행
+    }, 1000);
+    if (!composing) settle();
   });
+}
+
+// 안전장치: 미뤄서 처리한 직후, 방금 확정된 조합 글자가 커서 자리에 한 번 더 들어오면 되돌려요.
+let reinsertGuard = null;
+function armReinsertGuard(ta) {
+  reinsertGuard = lastCommit
+    ? { ta, value: ta.value, s: ta.selectionStart, e: ta.selectionEnd, data: lastCommit, until: Date.now() + 300 }
+    : null;
+}
+function checkReinsert(ta) {
+  const g = reinsertGuard;
+  if (!g || g.ta !== ta || composing) return false;
+  reinsertGuard = null;
+  if (Date.now() > g.until || g.s !== g.e) return false;
+  if (ta.value !== g.value.slice(0, g.s) + g.data + g.value.slice(g.s)) return false;
+  const top = ta.scrollTop;
+  ta.value = g.value;
+  ta.setSelectionRange(g.s, g.e);
+  ta.scrollTop = top;
+  emitText();
+  return true;
 }
 
 // 윈도우 크롬은 F10을 "손을 뗄 때" 메뉴 이동으로 처리할 수 있어서 keyup도 막아요
@@ -370,11 +568,11 @@ function onMyKeyup(e) {
   }
 }
 
-const SERVER_ACTIONS = new Set(["send", "delPartner", "pass"]);
+const SERVER_ACTIONS = new Set(["send", "delPartner", "pass", "clearMine"]);
 
 function runAction(action, ta) {
   if (!amWorker()) return;
-  // 내 칸만 고치는 동작(F3/F4/F10/F12)은 끊겨 있어도 돼요 — 재연결 때 내 글이 서버로 다시 가요
+  // 내 칸만 고치는 동작(F3/F4)은 끊겨 있어도 돼요 — 재연결 때 내 글이 서버로 다시 가요
   if (SERVER_ACTIONS.has(action) && !socket.connected) return toast("서버와 연결이 끊겨 있어요.");
   switch (action) {
     case "register":
@@ -386,12 +584,13 @@ function runAction(action, ta) {
     case "send":
       if (!amMain()) return toast("작성중인 작업자만 송출할 수 있어요. (지금은 대기중)");
       emitText(); // 마지막 입력을 먼저 보내고 송출
-      socket.emit("send_word");
+      sendFirstWord(ta);
       break;
     case "delLast": {
+      // 송출 안 된 부분의 마지막 어절만 지워요
       const v = ta.value;
-      const nv = v.replace(/\S+\s*$/, "");
-      if (nv === v) return;
+      const nv = v.slice(0, mySent) + v.slice(mySent).replace(/\S+\s*$/, "");
+      if (nv === v) return toast("지울 수 있는 어절이 없어요. (송출된 글은 지울 수 없어요)");
       const s = Math.min(ta.selectionStart, nv.length), en = Math.min(ta.selectionEnd, nv.length);
       ta.value = nv;
       ta.setSelectionRange(s, en);
@@ -403,37 +602,39 @@ function runAction(action, ta) {
       socket.emit("delete_partner_word");
       break;
     case "clearMine":
-      if (!ta.value) return;
+      // 칸 전체 + 송출 위치 초기화 (노란 창도 꺼짐 — 서버가 처리)
       ta.value = "";
-      emitText();
+      lastValue = "";
+      mySent = 0;
+      pendingOps = [];
+      clearPending = true;
+      paintBox(me.seat);
+      socket.timeout(5000).emit("clear_mine", (err, res) => {
+        clearPending = false;
+        if (!err && res && res.ok) myExt = Math.max(myExt, res.ext);
+      });
       break;
     case "pass":
-      if (!amMain()) return toast("작성중일 때만 턴을 넘길 수 있어요.");
-      socket.emit("pass_turn");
+      passTurn();
       break;
   }
 }
 
-// ---------- 상용구 (이 브라우저의 localStorage에 저장) ----------
-const PHRASE_KEY = "live_phrases";
-let phrases = loadPhrases();   // { 입력어: 출력어 }
+// ---------- 상용구 (서버에 작업자 이름별로 저장) ----------
+// 서버가 "지금 내 자리의 이름"으로 찾은 목록만 보내줘요 → 다른 작업자·다른 탭 것과 섞이지 않아요.
+let phrases = Object.create(null);   // { 입력어: 출력어 } — 프로토타입 없는 객체라 "__proto__"도 안전
+let phraseOwner = null;              // 지금 목록의 주인 이름
 
-function loadPhrases() {
-  try {
-    const v = JSON.parse(localStorage.getItem(PHRASE_KEY));
-    // 프로토타입 없는 객체 → "__proto__" 같은 입력어도 안전
-    const obj = Object.create(null);
-    if (v && typeof v === "object" && !Array.isArray(v)) {
-      for (const [k, out] of Object.entries(v)) if (typeof out === "string") obj[k] = out;
-    }
-    return obj;
-  } catch { return Object.create(null); }
-}
-function savePhrases() {
-  try { localStorage.setItem(PHRASE_KEY, JSON.stringify(phrases)); }
-  catch { toast("상용구를 저장하지 못했어요. (브라우저 저장소를 쓸 수 없음)"); }
+socket.on("snippets", (d) => {
+  if (!joined || !d) return;
+  const obj = Object.create(null);
+  if (d.items && typeof d.items === "object") {
+    for (const [k, out] of Object.entries(d.items)) if (typeof out === "string") obj[k] = out;
+  }
+  phrases = obj;
+  phraseOwner = d.name;
   renderPhraseList();
-}
+});
 const hasPhrase = (k) => Object.prototype.hasOwnProperty.call(phrases, k);
 
 // 내 칸의 내용을 바꾸고 커서를 놓은 뒤 모두에게 반영
@@ -453,23 +654,31 @@ function registerPhrase(ta) {
   let end = v.indexOf("\n", pos);
   if (end === -1) end = v.length;
   const line = v.slice(start, end);
+  if (start < mySent) return toast("이미 송출된 줄은 상용구로 등록할 수 없어요.");
 
   const m = line.match(/^\s*([^:：\s]+)\s*[:：](.*)$/); // 반각·전각 콜론 둘 다 허용
-  const out = m ? m[2].trim() : "";
+  const out = m ? m[2].trim() : "";   // 앞뒤 공백만 떼고 친 그대로
   if (!m || !out) {
     return toast("상용구 형식: 한 줄에 입력어:출력어 (예: 굿:굿 굿즈) — 입력어는 띄어쓰기 없이");
   }
+  if (!socket.connected) return toast("서버와 연결이 끊겨 있어 상용구를 저장할 수 없어요.");
   const key = m[1];
-  const replaced = hasPhrase(key) && phrases[key] !== out;
-  phrases[key] = out;
-  savePhrases();
 
   // 줄과 그 줄바꿈 하나를 같이 지움 (마지막 줄이면 앞 줄바꿈을 지움)
   let cutStart = start, cutEnd = end;
   if (end < v.length) cutEnd = end + 1;
-  else if (start > 0) cutStart = start - 1;
+  else if (start > 0 && start - 1 >= mySent) cutStart = start - 1;
   setMyText(ta, v.slice(0, cutStart) + v.slice(cutEnd), cutStart);
-  toast(`상용구 ${replaced ? "덮어씀" : "등록"}: ${key} → ${out}`);
+
+  phrases[key] = out; // 바로 F3을 눌러도 되게 먼저 반영 (서버 응답으로 확정)
+  renderPhraseList();
+  socket.timeout(5000).emit("snippet_set", { key, out }, (err, res) => {
+    if (err || !res || !res.ok) {
+      socket.emit("snippets_get"); // 서버 목록으로 되돌림
+      return toast((res && res.message) || "상용구를 서버에 저장하지 못했어요. 다시 시도해주세요.");
+    }
+    toast(`상용구 ${res.replaced ? "덮어씀" : "등록"}: ${res.key} → ${res.out}`);
+  });
 }
 
 // F3: 커서 바로 앞 어절이 입력어면 출력어로 바꿔요
@@ -479,6 +688,7 @@ function expandPhrase(ta) {
   const m = v.slice(0, pos).match(/\S+$/);
   if (!m) return toast("커서 바로 앞에 어절이 없어요.");
   const key = m[0];
+  if (pos - key.length < mySent) return toast("이미 송출된 어절은 바꿀 수 없어요.");
   if (!hasPhrase(key)) return toast(`'${key}'은(는) 등록된 상용구가 아니에요.`);
   const out = phrases[key];
   const start = pos - key.length;
@@ -487,13 +697,13 @@ function expandPhrase(ta) {
 
 function renderPhraseList() {
   const keys = Object.keys(phrases).sort((a, b) => a.localeCompare(b, "ko"));
-  $("phrase-count").textContent = `${keys.length}개`;
+  $("phrase-count").textContent = phraseOwner ? `${phraseOwner} · ${keys.length}개` : `${keys.length}개`;
   $("phrase-list").innerHTML = keys.length
     ? keys.map((k) => `<li>
         <span class="p-key" title="${esc(k)}">${esc(k)}</span><span class="p-arrow">→</span>
         <span class="p-out">${esc(phrases[k])}</span>
         <button class="icon-btn" data-del-phrase="${esc(k)}" title="삭제">🗑️</button></li>`).join("")
-    : `<li class="empty">등록된 상용구가 없어요</li>`;
+    : `<li class="empty">${joined ? "등록된 상용구가 없어요" : "입장하면 내 이름의 상용구가 보여요"}</li>`;
 }
 
 let phraseReturnFocus = null;
@@ -515,27 +725,47 @@ $("phrase-modal").addEventListener("click", (e) => {
   const del = e.target.closest("[data-del-phrase]");
   if (del) {
     const k = del.dataset.delPhrase;
-    delete phrases[k];
-    savePhrases();
-    toast(`상용구 삭제: ${k}`);
+    if (!socket.connected) return toast("서버와 연결이 끊겨 있어 삭제할 수 없어요.");
+    socket.timeout(5000).emit("snippet_del", { key: k }, (err, res) => {
+      if (err || !res || !res.ok) return toast((res && res.message) || "상용구를 삭제하지 못했어요.");
+      if (hasPhrase(k)) { delete phrases[k]; renderPhraseList(); }
+      toast(`상용구 삭제: ${k}`);
+    });
   }
 });
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !$("phrase-modal").classList.contains("hidden")) closePhrases();
 });
-// 같은 브라우저의 다른 탭에서 등록·삭제하면 이 탭에도 반영
-window.addEventListener("storage", (e) => {
-  if (e.key !== PHRASE_KEY) return;
-  phrases = loadPhrases();
-  renderPhraseList();
-});
 
-// ---------- 방송 영상 (YouTube IFrame Player API, 내 화면에서만) ----------
-const YT_STORE_KEY = "live_yt_url";
+// ---------- 방송 영상 (YouTube IFrame Player API, 방 전체가 같이 봐요) ----------
+// 서버가 { id, playing, pos(기준 시간), at(기준 시각) }을 들고 있고, 각자 플레이어를 그 상태에 맞춰요.
+// 지금 위치 = playing ? pos + (서버 지금 - at) : pos.  1.5초 넘게 어긋나면 자동으로 맞춰요.
+// 열기·조작은 작업자만, 관전자는 보기만 (플레이어 위에 투명 막을 씌워요).
 let ytPlayer = null;       // YT.Player
 let ytReady = false;       // 플레이어 준비 완료
-let ytVideoId = null;      // 지금 열린 영상
 let ytApiPromise = null;
+let vs = null;             // 서버의 영상 상태
+let clockOffset = 0;       // 서버 시계 - 내 시계 (초)
+let suppressUntil = 0;     // 코드로 플레이어를 움직인 직후엔 상태 변화를 "사용자 조작"으로 보지 않음
+let lastPlayerTouch = 0;   // 플레이어(iframe)를 마지막으로 클릭한 시각
+let mutedByUs = false;     // 자동재생 제한 때문에 우리가 소리를 끈 상태
+let playBlocked = false;   // 소리를 꺼도 재생이 막힘 → 클릭해야 재생
+let autoplayTimer = null;
+const DRIFT_MAX = 1.5;     // 재생 중 이만큼(초) 넘게 어긋나면 맞춤
+
+const serverNow = () => Date.now() / 1000 + clockOffset;
+
+// 서버 시계와의 차이: 왕복 시간의 절반을 빼서 계산 (입장 때, 그리고 1분마다)
+function syncClock() {
+  const t0 = Date.now();
+  socket.timeout(5000).emit("clock", (err, res) => {
+    if (err || !res) return;
+    const t1 = Date.now();
+    clockOffset = res.now - (t0 + t1) / 2000;
+  });
+}
+socket.on("connect", syncClock);
+setInterval(() => { if (socket.connected) syncClock(); }, 60000);
 
 // 링크 → { id, start }. watch?v= / youtu.be/ / /live/ / /shorts/ / /embed/ / 11자리 id
 function parseYouTube(raw) {
@@ -589,67 +819,244 @@ const YT_ERRORS = {
   150: "이 영상은 퍼가기(외부 재생)가 막혀 있어요. 유튜브에서 직접 봐주세요.",
 };
 
-async function openYouTube(raw) {
-  const v = parseYouTube(raw);
-  if (!v) return toast("유튜브 링크 형식이 아니에요. (watch?v= · youtu.be · /live/ · /shorts/)");
-  try { sessionStorage.setItem(YT_STORE_KEY, raw.trim()); } catch {}
-  $("yt-empty").classList.add("hidden");
-  $("yt-wrap").classList.remove("hidden");
+// ----- 서버 상태 받기 -----
+socket.on("video", (d) => {
+  if (!joined) return;
+  if (d.by && vs && d.video && d.video.id !== vs.id && myInfo() && d.by !== myInfo().name) toast(`${d.by}님이 새 영상을 열었어요.`);
+  applyVideo(d);
+});
+
+function applyVideo(d) {
+  const prevId = vs && vs.id;
+  vs = d && d.video ? d.video : null;
+  if (vs && vs.id !== prevId) { playBlocked = false; }
+  updateVideoUI();
+  if (!vs) return;
+  const url = $("yt-url");
+  if (document.activeElement !== url) url.value = `https://youtu.be/${vs.id}`;
+  ensurePlayer().then(() => syncPlayer(true)).catch(() => {});
+}
+
+// 지금 영상이 있어야 할 위치(초)
+function expectedPos() {
+  if (!vs) return 0;
+  let t = vs.playing ? vs.pos + Math.max(0, serverNow() - vs.at) : vs.pos;
+  const dur = ytReady && ytPlayer.getDuration ? ytPlayer.getDuration() || 0 : 0;
+  if (dur > 0 && !isLive()) t = Math.min(t, Math.max(0, dur - 0.3));
+  return t;
+}
+function isLive() {
+  try { return !!(ytPlayer.getVideoData && ytPlayer.getVideoData().isLive); } catch { return false; }
+}
+const suppress = (ms = 1500) => { suppressUntil = Date.now() + ms; };
+const playerTime = () => (ytReady && ytPlayer.getCurrentTime ? ytPlayer.getCurrentTime() || 0 : expectedPos());
+
+async function ensurePlayer() {
+  if (ytPlayer) return;
   try {
     await loadYouTubeApi();
-  } catch {
-    return toast("유튜브 플레이어를 불러오지 못했어요. 인터넷 연결을 확인해주세요.");
+  } catch (e) {
+    toast("유튜브 플레이어를 불러오지 못했어요. 인터넷 연결을 확인해주세요.");
+    throw e;
   }
-  ytVideoId = v.id;
-  if (ytPlayer && ytReady) {
-    ytPlayer.loadVideoById({ videoId: v.id, startSeconds: v.start });
-    return;
-  }
-  if (ytPlayer) return; // 아직 준비 중 — onReady에서 최신 ytVideoId를 열어요
+  if (ytPlayer || !vs) return;
   ytPlayer = new YT.Player("yt-player", {
-    videoId: v.id,
-    playerVars: { playsinline: 1, rel: 0, start: v.start, origin: location.origin },
+    playerVars: { playsinline: 1, rel: 0, origin: location.origin },
     events: {
-      onReady: () => {
-        ytReady = true;
-        if (ytPlayer.getVideoData && ytPlayer.getVideoData().video_id !== ytVideoId) ytPlayer.loadVideoById(ytVideoId);
-      },
+      onReady: () => { ytReady = true; syncPlayer(true); },
+      onStateChange: onPlayerState,
       onError: (e) => toast(YT_ERRORS[e.data] || `영상을 재생할 수 없어요. (오류 ${e.data})`),
     },
   });
 }
 
+// 플레이어를 서버 상태에 맞춰요. hard=true면 조금만 어긋나도 맞춤 (상태가 막 바뀌었을 때)
+function syncPlayer(hard = false) {
+  if (!ytReady || !vs) return;
+  const exp = expectedPos();
+  let curId = null;
+  try { curId = ytPlayer.getVideoData().video_id; } catch {}
+  if (curId !== vs.id) {
+    suppress(2500);
+    if (vs.playing) {
+      ytPlayer.loadVideoById({ videoId: vs.id, startSeconds: exp });
+      scheduleAutoplayCheck();
+    } else {
+      ytPlayer.cueVideoById({ videoId: vs.id, startSeconds: exp });
+    }
+    return;
+  }
+  const st = ytPlayer.getPlayerState();
+  const cur = ytPlayer.getCurrentTime() || 0;
+  if (vs.playing) {
+    if (st === 0 && !isLive() && exp >= (ytPlayer.getDuration() || 0) - 1) return; // 끝까지 재생됨
+    if (Math.abs(cur - exp) > (hard ? 1.0 : DRIFT_MAX)) { suppress(); ytPlayer.seekTo(exp, true); }
+    if (st !== 1 && st !== 3 && !playBlocked) {
+      suppress();
+      ytPlayer.playVideo();
+      scheduleAutoplayCheck();
+    }
+  } else {
+    if (st === 1 || st === 3) { suppress(); ytPlayer.pauseVideo(); }
+    // 맨 처음 불러온(cue) 상태에서 seekTo를 하면 재생이 시작돼서 건너뜀 (cue에 시작 위치가 들어 있어요)
+    if (st !== 5 && st !== -1 && Math.abs(cur - exp) > 0.5) { suppress(); ytPlayer.seekTo(exp, true); }
+  }
+}
+
+// 2초마다 어긋남 확인. 작업자가 방금 플레이어를 직접 만졌다면(시간 이동) 그걸 모두에게 보내요.
+setInterval(() => {
+  if (!joined || !ytReady || !vs) return;
+  if (userTouchingPlayer()) {
+    const cur = playerTime(), exp = expectedPos();
+    if (Math.abs(cur - exp) > (vs.playing ? DRIFT_MAX : 0.5)) return sendVideo("seek", cur, false);
+  }
+  syncPlayer(false);
+}, 2000);
+
+// 작업자가 플레이어를 클릭한 직후(5초)에 생긴 변화만 "사용자 조작"으로 봐요.
+// (버퍼링으로 잠깐 멈춘 걸 일시정지로 착각해서 모두를 멈추게 하지 않으려고)
+function userTouchingPlayer() {
+  if (!amWorker() || Date.now() < suppressUntil) return false;
+  const iframe = ytPlayer && ytPlayer.getIframe ? ytPlayer.getIframe() : null;
+  return Date.now() - lastPlayerTouch < 5000 || (iframe && document.activeElement === iframe);
+}
+
+function onPlayerState(e) {
+  if (!vs) return;
+  if (e.data === 1 && mutedByUs) showUnlock("sound");
+  if (e.data === 1 || e.data === 3) { if (playBlocked) { playBlocked = false; hideUnlock(); } }
+  if (!userTouchingPlayer()) return;
+  const cur = playerTime();
+  if (e.data === 1 && !vs.playing) sendVideo("play", cur, false);
+  else if (e.data === 2 && vs.playing) sendVideo("pause", cur, false);
+  else if ((e.data === 1 || e.data === 2) && Math.abs(cur - expectedPos()) > (vs.playing ? DRIFT_MAX : 0.5)) sendVideo("seek", cur, false);
+}
+
+// 작업자의 조작 → 내 상태를 먼저 바꾸고(바로 반응) 서버로 보내요
+function sendVideo(action, pos, applyLocal = true) {
+  if (!vs) return;
+  if (!amWorker()) return toast("영상 조작은 작업자만 할 수 있어요.");
+  if (!socket.connected) return toast("서버와 연결이 끊겨 있어요.");
+  vs = { ...vs, pos: Math.max(0, pos), at: serverNow(), playing: action === "play" ? true : action === "pause" ? false : vs.playing };
+  if (applyLocal) syncPlayer(true);
+  else suppress(800);
+  socket.emit("video_ctrl", { action, pos: vs.pos });
+}
+
+// ----- 자동재생 제한 -----
+// 소리 있는 재생이 막히면 → 소리를 끄고 재생 + "클릭해서 소리 켜기", 그래도 막히면 "클릭해서 재생"
+let autoplayPending = false; // 확인이 진행 중이면 2초마다 도는 맞추기가 다시 시작하지 않게
+function scheduleAutoplayCheck() {
+  if (autoplayPending) return;
+  autoplayPending = true;
+  const done = () => { autoplayPending = false; };
+  autoplayTimer = setTimeout(() => {
+    if (!vs || !vs.playing || !ytReady) return done();
+    const st = ytPlayer.getPlayerState();
+    if (st === 1 || st === 3) return done();
+    mutedByUs = true;
+    ytPlayer.mute();
+    suppress();
+    ytPlayer.playVideo();
+    autoplayTimer = setTimeout(() => {
+      done();
+      if (!vs || !vs.playing || !ytReady) return;
+      const st2 = ytPlayer.getPlayerState();
+      if (st2 === 1 || st2 === 3) showUnlock("sound");
+      else { playBlocked = true; showUnlock("play"); }
+    }, 1500);
+  }, 1500);
+}
+function showUnlock(kind) {
+  const b = $("yt-unlock");
+  b.dataset.kind = kind;
+  b.textContent = kind === "play" ? "▶ 클릭해서 재생" : "🔇 클릭해서 소리 켜기";
+  b.classList.remove("hidden");
+}
+function hideUnlock() { $("yt-unlock").classList.add("hidden"); }
+$("yt-unlock").addEventListener("click", () => {
+  if (!ytReady) return;
+  ytPlayer.unMute();
+  mutedByUs = false;
+  playBlocked = false;
+  hideUnlock();
+  syncPlayer(true);
+  if (vs && vs.playing) { suppress(); ytPlayer.playVideo(); }
+  const box = myBox();
+  if (box) box.focus(); // 입력하던 칸으로 돌아가요
+});
+
+// ----- 화면 -----
+function updateVideoUI() {
+  const worker = amWorker();
+  $("yt-form").classList.toggle("hidden", !worker);
+  $("yt-shield").classList.toggle("hidden", worker);
+  $("yt-empty").classList.toggle("hidden", !!vs);
+  $("yt-wrap").classList.toggle("hidden", !vs);
+  $("yt-empty").innerHTML = worker
+    ? '유튜브 링크를 넣고 "열기"를 누르세요.<br>방에 있는 모두에게 같은 영상이 재생돼요.'
+    : "작업자가 영상을 열면 여기에 같이 재생돼요.";
+}
+
+function teardownVideo() {
+  clearTimeout(autoplayTimer);
+  autoplayPending = false;
+  vs = null;
+  if (ytPlayer) {
+    try { ytPlayer.destroy(); } catch {}
+  }
+  ytPlayer = null;
+  ytReady = false;
+  mutedByUs = playBlocked = false;
+  hideUnlock();
+  if (!$("yt-player")) {
+    const div = document.createElement("div");
+    div.id = "yt-player";
+    $("yt-wrap").prepend(div);
+  }
+  updateVideoUI();
+}
+
 $("yt-form").addEventListener("submit", (e) => {
   e.preventDefault();
-  openYouTube($("yt-url").value);
+  if (!amWorker()) return toast("영상은 작업자만 열 수 있어요.");
+  const v = parseYouTube($("yt-url").value);
+  if (!v) return toast("유튜브 링크 형식이 아니에요. (watch?v= · youtu.be · /live/ · /shorts/)");
+  if (!socket.connected) return toast("서버와 연결이 끊겨 있어요.");
+  socket.emit("video_open", { id: v.id, start: v.start });
 });
-try { $("yt-url").value = sessionStorage.getItem(YT_STORE_KEY) || ""; } catch {}
 
 let flashTimer = null;
-function seekBy(delta) {
-  if (!ytPlayer || !ytReady || !ytVideoId || typeof ytPlayer.getCurrentTime !== "function") return; // 영상 없음 → 아무것도 안 함
-  const dur = ytPlayer.getDuration() || 0;
-  let t = Math.max(0, (ytPlayer.getCurrentTime() || 0) + delta);
-  if (dur > 0 && !isLive()) t = Math.min(t, Math.max(0, dur - 0.5));
-  ytPlayer.seekTo(t, true);
+function flash(text) {
   const f = $("yt-flash");
-  f.textContent = delta < 0 ? `◀◀ ${-delta}초` : `${delta}초 ▶▶`;
+  f.textContent = text;
   f.classList.remove("hidden");
   clearTimeout(flashTimer);
   flashTimer = setTimeout(() => f.classList.add("hidden"), 600);
 }
-function isLive() {
-  try { return !!(ytPlayer.getVideoData && ytPlayer.getVideoData().isLive); } catch { return false; }
+function seekBy(delta) {
+  if (!vs) return;
+  if (!amWorker()) return toast("영상 조작은 작업자만 할 수 있어요.");
+  sendVideo("seek", playerTime() + delta);
+  flash(delta < 0 ? `◀◀ ${-delta}초` : `${delta}초 ▶▶`);
+}
+function togglePlay() {
+  if (!vs) return toast("열린 영상이 없어요.");
+  if (!amWorker()) return toast("영상 조작은 작업자만 할 수 있어요.");
+  const play = !vs.playing;
+  sendVideo(play ? "play" : "pause", playerTime());
+  flash(play ? "▶ 재생" : "❚❚ 일시정지");
 }
 
-// F7/F9: 어디에 포커스가 있든(입력칸 포함) 동작, 포커스는 건드리지 않아요.
+// F2 재생/일시정지, F7/F9 2초 뒤로/앞으로: 어디에 포커스가 있든(입력칸 포함) 동작, 포커스는 그대로.
 // 캡처 단계에서 먼저 받아서 처리 — 크롬의 F7(캐럿 브라우징 안내창)도 막아요.
-const SEEK_KEYS = { F7: -2, F9: 2 };
+const VIDEO_KEYS = { F2: "toggle", F7: -2, F9: 2 };
 document.addEventListener("keydown", (e) => {
-  const delta = SEEK_KEYS[e.code] ?? SEEK_KEYS[e.key];
-  if (delta === undefined || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
+  const k = VIDEO_KEYS[e.code] ?? VIDEO_KEYS[e.key];
+  if (k === undefined || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
   e.preventDefault();
-  if (joined) seekBy(delta);
+  if (!joined || e.repeat && k === "toggle") return;
+  if (k === "toggle") togglePlay(); else seekBy(k);
 }, true);
 
 // 영상(iframe)을 클릭하면 키보드 포커스가 유튜브로 넘어가서 타이핑·단축키가 먹히지 않아요.
@@ -659,27 +1066,90 @@ document.addEventListener("focusin", (e) => { lastFocused = e.target; });
 window.addEventListener("blur", () => {
   setTimeout(() => {
     const active = document.activeElement;
+    if (!(active && active.tagName === "IFRAME" && $("yt-wrap").contains(active))) return;
+    lastPlayerTouch = Date.now(); // 플레이어를 직접 조작하는 중
     const box = myBox();
-    if (active && active.tagName === "IFRAME" && $("yt-wrap").contains(active) && box && lastFocused === box) {
-      box.focus();
-    }
+    if (box && lastFocused === box) box.focus();
   }, 0);
 });
 
 // ---------- 송출 이력 ----------
+// 송출 이력은 옆 패널과 "크게 보기" 화면 두 곳에 똑같이 그려요. 최신 줄이 항상 보이게 맨 아래로.
+const historyEls = () => [$("history"), $("big-text")];
+function scrollHistory() {
+  for (const el of historyEls()) el.scrollTop = el.scrollHeight;
+}
 function setHistory(text) {
   historyText = text;
-  const el = $("history");
-  el.textContent = text;
-  el.scrollTop = el.scrollHeight;
+  for (const el of historyEls()) el.textContent = text;
+  scrollHistory();
 }
 function appendHistory(chunk) {
   historyText += chunk;
-  const el = $("history");
-  const stick = nearBottom(el);
-  el.appendChild(document.createTextNode(chunk));
-  if (stick) el.scrollTop = el.scrollHeight;
+  for (const el of historyEls()) el.appendChild(document.createTextNode(chunk));
+  scrollHistory();
 }
+
+// ----- 글자 크기 (각자 브라우저에 저장) -----
+const FONT_KEY = "live_hist_font";
+const FONT_LIMITS = { panel: [14, 48, 22], big: [24, 120, 56] }; // [최소, 최대, 기본]
+let fontSizes = loadFontSizes();
+function loadFontSizes() {
+  const out = { panel: FONT_LIMITS.panel[2], big: FONT_LIMITS.big[2] };
+  try {
+    const v = JSON.parse(localStorage.getItem(FONT_KEY));
+    for (const k of Object.keys(out)) {
+      const n = v && typeof v === "object" ? v[k] : undefined;
+      if (typeof n === "number" && Number.isFinite(n)) out[k] = Math.min(FONT_LIMITS[k][1], Math.max(FONT_LIMITS[k][0], n));
+    }
+  } catch {}
+  return out;
+}
+function applyFontSizes() {
+  document.documentElement.style.setProperty("--hist-font", fontSizes.panel + "px");
+  document.documentElement.style.setProperty("--big-font", fontSizes.big + "px");
+  scrollHistory();
+}
+function changeFont(which, dir) {
+  const [lo, hi] = FONT_LIMITS[which];
+  const step = which === "big" ? 8 : 2;
+  fontSizes[which] = Math.min(hi, Math.max(lo, fontSizes[which] + dir * step));
+  try { localStorage.setItem(FONT_KEY, JSON.stringify(fontSizes)); } catch {}
+  applyFontSizes();
+  toast(`글자 크기 ${fontSizes[which]}px`);
+}
+applyFontSizes();
+$("font-down").addEventListener("click", () => changeFont("panel", -1));
+$("font-up").addEventListener("click", () => changeFont("panel", 1));
+$("big-font-down").addEventListener("click", () => changeFont("big", -1));
+$("big-font-up").addEventListener("click", () => changeFont("big", 1));
+
+// ----- 크게 보기 (송출 이력만 화면 전체에, 검은 배경·흰 글씨) -----
+let bigReturnFocus = null;
+const bigOpen = () => !$("big-view").classList.contains("hidden");
+function openBig() {
+  bigReturnFocus = lastFocused === myBox() ? myBox() : null;
+  $("big-view").classList.remove("hidden");
+  scrollHistory();
+  const el = document.documentElement;
+  if (el.requestFullscreen) el.requestFullscreen().catch(() => {}); // 진짜 전체 화면 (안 되면 창 안에서만)
+  if (bigReturnFocus) bigReturnFocus.focus(); // 작업자는 크게 보면서도 계속 칠 수 있게
+}
+function closeBig() {
+  if (!bigOpen()) return;
+  $("big-view").classList.add("hidden");
+  if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+  scrollHistory();
+  if (bigReturnFocus && document.contains(bigReturnFocus)) bigReturnFocus.focus();
+  bigReturnFocus = null;
+}
+$("big-btn").addEventListener("click", openBig);
+$("big-close").addEventListener("click", closeBig);
+// 전체 화면에서 ESC를 누르면 브라우저가 전체 화면을 먼저 끄므로 그때 같이 닫아요
+document.addEventListener("fullscreenchange", () => { if (!document.fullscreenElement) closeBig(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && bigOpen()) closeBig();
+});
 
 $("history-download").addEventListener("click", () => {
   if (!historyText) return toast("송출 이력이 비어 있어요.");
@@ -819,8 +1289,10 @@ function renderRoom() {
     if (el.dataset.seat !== String(w.id) || !el.contains(boxes.get(w.id))) {
       el.dataset.seat = w.id;
       el.innerHTML = `<div class="writer-head"></div>`;
-      el.appendChild(getBox(w.id, isMe).parentElement); // textarea + 노란 줄 레이어
+      el.appendChild(getBox(w.id, isMe).parentElement); // textarea + 송출 표시 레이어
     }
+    // 대기 작업자가 Enter를 쳤으면 칸 전체가 노란 창 (턴을 받으면 서버가 꺼요)
+    boxes.get(w.id).parentElement.classList.toggle("standby", !!w.standby && !isMain);
     el.querySelector(".writer-head").innerHTML =
       `<span class="dot ${w.online ? "worker" : "offline"}"></span>
        <span class="who">${esc(w.name)}</span>${isMe ? '<span class="tag">(나)</span>' : ""}
@@ -839,11 +1311,13 @@ function renderRoom() {
   }
 
   const worker = amWorker();
+  updateVideoUI();
   $("key-hint").classList.toggle("hidden", !worker);
   $("history-clear").classList.toggle("hidden", !worker);
 
   // 작업자 → 관전자로 바뀌었으면 내 칸 관련 상태 정리
-  if (!worker) { pendingOps = []; composing = false; }
+  if (!worker) { pendingOps = []; afterIme = []; composing = false; }
+  if (amMain()) maybeAutoSend(); // 턴을 받았을 때 이미 완성 어절이 3개 이상이면 바로 송출
   if (swapArm && !(worker && state.seats[swapArm.target] && state.seats[swapArm.target].ready)) disarmSwap();
 
   // 대기열 (관전자, 들어온 순서대로). 초록불 = 작업하고 싶다는 신호
@@ -908,7 +1382,7 @@ socket.on("swap_confirm", (d) => {
 });
 
 document.querySelector(".writers").addEventListener("click", (e) => {
-  if (e.target.closest("[data-pass]")) socket.emit("pass_turn");
+  if (e.target.closest("[data-pass]")) passTurn();
 });
 
 $("leave-btn").addEventListener("click", () => socket.emit("leave"));
