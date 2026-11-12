@@ -35,11 +35,13 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&
 const roleText = (r) => (r === "worker" ? "작업자" : r === "spectator" ? "관전자" : "");
 const nearBottom = (el) => el.scrollHeight - el.scrollTop - el.clientHeight < 30;
 
+// 저장된 입장 정보 { room, seat, token }. 방 번호가 없는 옛 형식(방이 하나이던 때)이거나 깨졌으면 지워요.
 function loadMe() {
-  try {
-    const v = JSON.parse(sessionStorage.getItem(STORE_KEY));
-    return v && typeof v.room === "number" ? v : null; // 방이 하나이던 때 저장한 값은 버려요
-  } catch { return null; }
+  let v = null;
+  try { v = JSON.parse(sessionStorage.getItem(STORE_KEY)); } catch {}
+  const ok = v && Number.isInteger(v.room) && Number.isInteger(v.seat) && typeof v.token === "string";
+  if (!ok) { try { sessionStorage.removeItem(STORE_KEY); } catch {} }
+  return ok ? v : null;
 }
 function saveMe(v) {
   me = v;
@@ -105,6 +107,8 @@ socket.on("state", (s) => {
 });
 socket.on("rooms", (list) => {
   roomsList = Array.isArray(list) ? list : [];
+  // 저장된 입장 정보의 방이 서버에 없으면 지워요 (예: /room/9 → 서버가 / 로 돌려보낸 경우)
+  if (me && roomsList.length && !roomsList.some((r) => r.id === me.room)) saveMe(null);
   if (currentRoom === null) renderRooms();
 });
 socket.on("joined", (d) => {
@@ -142,10 +146,35 @@ socket.on("joined", (d) => {
   applyVideo(d.video);
 });
 socket.on("join_error", (d) => {
+  if (d.code === "no_room") return dropToRooms();
   if (d.clear) { saveMe(null); joined = false; resetRoomLocal(); teardownVideo(); }
-  toast(d.message);
+  if (d.code === "outdated") showUpdateBar();
+  if (d.message) toast(d.message);
   render();
 });
+// 주소의 방이 서버에 없음 (방 개수가 줄었거나 옛 주소) → 저장 정보를 지우고 조용히 방 목록으로 (토스트 없이)
+socket.on("watch_error", (d) => { if (d && d.code === "no_room") dropToRooms(); });
+function dropToRooms() {
+  saveMe(null);
+  joined = false;
+  resetRoomLocal();
+  teardownVideo();
+  setHistory("");
+  currentRoom = null;
+  state = null;
+  history.replaceState({}, "", "/");
+  render();
+}
+
+// ---------- 새 버전 감지 ----------
+// 페이지에 심어진 버전과, 서버가 연결/재연결 때마다 보내는 버전("hello")이 다르면 → 서버가 새로 배포된 것.
+// 자동으로 새로고침하진 않고(치는 중일 수 있으니) 위에 안내를 띄워요. 새로고침해도 자리·입력 내용은 돌아와요.
+const PAGE_VERSION = (document.querySelector('meta[name="app-version"]') || {}).content || "";
+socket.on("hello", (d) => {
+  if (d && d.version && PAGE_VERSION && d.version !== PAGE_VERSION) showUpdateBar();
+});
+function showUpdateBar() { $("update-bar").classList.remove("hidden"); }
+$("update-reload").addEventListener("click", () => location.reload());
 socket.on("left", () => { saveMe(null); joined = false; resetRoomLocal(); teardownVideo(); render(); });
 socket.on("toast", (d) => toast(d.message));
 

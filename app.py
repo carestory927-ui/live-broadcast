@@ -28,6 +28,7 @@
 버전(ext_ver)을 올려요. 작업자가 그 사실을 아직 모른 채 보낸 글(옛 버전)이 도착하면 서버가 같은 잘라내기를
 다시 적용하고, 옛 버전 기준의 송출 위치도 그만큼 당겨서 해석해요.
 """
+import hashlib
 import json
 import os
 import re
@@ -35,7 +36,7 @@ import secrets
 import threading
 import time
 
-from flask import Flask, redirect, render_template, request
+from flask import Flask, make_response, redirect, render_template, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
 
 app = Flask(__name__)
@@ -381,27 +382,67 @@ def release_if_still_offline(room, seat_id, token):
 
 # ---------- 화면 ----------
 
+# ---------- 버전 (배포 후 옛 화면 방지) ----------
+# 파일 "내용"의 해시를 버전으로 써요. (배포 환경은 파일 수정시각을 고정값으로 바꿔버리기도 해서 시각보다 안전해요)
+# - 정적 파일 주소에 ?v=<그 파일 해시> → 내용이 바뀌면 주소가 바뀌어 브라우저가 반드시 새로 받아요.
+# - APP_VERSION(서버·화면 파일 전체 해시)을 페이지에 심고, 연결/재연결 때마다 "hello"로도 보내요.
+#   열려 있던 탭은 둘이 다르면 "새 버전이 있어요. 새로고침" 안내를 띄워요.
+_hash_cache = {}   # 경로 → (수정시각, 해시)  — 내용이 바뀌었을 때만 다시 계산
+
+
+def _file_hash(path):
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return "0"
+    hit = _hash_cache.get(path)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    try:
+        with open(path, "rb") as f:
+            h = hashlib.md5(f.read()).hexdigest()[:10]
+    except OSError:
+        return "0"
+    _hash_cache[path] = (mtime, h)
+    return h
+
+
+_VERSION_FILES = [
+    os.path.abspath(__file__),
+    os.path.join(app.root_path, "templates", "index.html"),
+    os.path.join(app.static_folder, "live.js"),
+    os.path.join(app.static_folder, "live.css"),
+    os.path.join(app.static_folder, "socket.io.min.js"),
+]
+
+
+def app_version():
+    return hashlib.md5("".join(_file_hash(p) for p in _VERSION_FILES).encode()).hexdigest()[:10]
+
+
 @app.context_processor
 def _asset_version():
-    """정적 파일 주소에 ?v=수정시각 을 붙여요 → 배포하면 브라우저가 옛 CSS/JS를 쓰지 않고 새로 받아요."""
     def asset_v(filename):
-        try:
-            return int(os.path.getmtime(os.path.join(app.static_folder, filename)))
-        except OSError:
-            return 0
-    return {"asset_v": asset_v}
+        return _file_hash(os.path.join(app.static_folder, filename))
+    return {"asset_v": asset_v, "app_version": app_version()}
+
+
+def _page():
+    resp = make_response(render_template("index.html"))
+    resp.headers["Cache-Control"] = "no-cache"  # 페이지(HTML)는 항상 서버에 확인 → 새 버전 주소를 받게
+    return resp
 
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return _page()
 
 
 @app.route("/room/<int:rid>")
 def room_page(rid):
     if rid not in rooms:
         return redirect("/")
-    return render_template("index.html")
+    return _page()
 
 
 @app.route("/health")
@@ -416,15 +457,17 @@ def on_connect():
     with lock:
         conns[request.sid] = {"room": None, "seat": None}
         summ = rooms_summary()
+    emit("hello", {"version": app_version()})  # 열려 있던 탭이 서버 새 버전을 알아채게
     emit("rooms", summ)
 
 
 @socketio.on("watch")
 def on_watch(data):
-    """방 카드를 누름(또는 /room/N 주소로 들어옴) → 그 방의 자리 화면을 봐요. {room}"""
+    """방 카드를 누름(또는 /room/N 주소로 들어옴) → 그 방의 자리 화면을 봐요. {room}
+    없는 방이면 watch_error(code=no_room) → 브라우저가 조용히 방 목록으로 가요."""
     room = get_room((data or {}).get("room"))
     if room is None:
-        return emit("toast", {"message": "없는 방이에요."})
+        return emit("watch_error", {"code": "no_room"})
     with lock:
         _room, seat_id = ctx()
         if seat_id is not None and _room is not room:
@@ -474,9 +517,13 @@ def on_rename_room(data):
 @socketio.on("join")
 def on_join(data):
     data = data or {}
+    if "room" not in data:
+        # 방이 하나이던 때의 옛 화면(배포 전부터 열려 있던 탭)이 재연결하며 보낸 입장 요청
+        return emit("join_error", {"message": "새 버전이 배포됐어요. 새로고침(F5)해 주세요.",
+                                   "clear": True, "code": "outdated"})
     room = get_room(data.get("room"))
     if room is None:
-        return emit("join_error", {"message": "없는 방이에요.", "clear": True})
+        return emit("join_error", {"message": "", "clear": True, "code": "no_room"})
     try:
         seat_id = int(data.get("seat"))
     except (TypeError, ValueError):

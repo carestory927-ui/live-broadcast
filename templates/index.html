@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="app-version" content="{{ app_version }}">
   <title>실시간 방송 자막</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='live.css', v=asset_v('live.css')) }}">
 </head>
@@ -118,10 +119,14 @@
     <div id="big-text" class="big-text"></div>
   </div>
 
+  <div id="update-bar" class="update-bar hidden" role="status">
+    새 버전이 있어요. 새로고침하면 적용돼요. (입장한 자리·입력 내용은 그대로 돌아와요)
+    <button id="update-reload" class="btn small" type="button">새로고침</button>
+  </div>
   <div id="conn" class="conn hidden">서버와 다시 연결하는 중…</div>
   <div id="toast" class="toast hidden"></div>
 
-  <script src="{{ url_for('static', filename='socket.io.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='socket.io.min.js', v=asset_v('socket.io.min.js')) }}"></script>
   <script src="{{ url_for('static', filename='live.js', v=asset_v('live.js')) }}"></script>
 </body>
 </html>
