@@ -2,10 +2,18 @@
 const socket = io();
 const STORE_KEY = "live_me";
 
-let state = null;          // 서버가 보내주는 전체 상태
-let me = loadMe();         // { seat, token } — 새로고침해도 같은 자리로 복귀
+let state = null;          // 서버가 보내주는 "지금 보고 있는 방"의 전체 상태
+let me = loadMe();         // { room, seat, token } — 새로고침해도 같은 방·같은 자리로 복귀
 let joined = false;        // 서버가 입장을 확인했는지
-let editingSeat = null;    // 메인 화면에서 이름 수정 중인 자리
+let editingSeat = null;    // 방 입장 화면에서 이름 수정 중인 자리
+let currentRoom = roomFromPath(); // 주소 /room/N 의 N (방 목록 화면이면 null)
+let roomsList = [];        // 방 목록 요약 [{ id, name, workers, spectators, ... }]
+let editingRoom = null;    // 방 목록에서 이름 수정 중인 방
+
+function roomFromPath() {
+  const m = location.pathname.match(/^\/room\/(\d+)\/?$/);
+  return m ? Number(m[1]) : null;
+}
 
 // 입력칸 / 송출 이력
 const boxes = new Map();   // 자리 번호 → textarea (한 번 만들면 계속 재사용 → 커서·조합 유지)
@@ -20,6 +28,7 @@ let clearPending = false;  // F12 직후 서버 확인 전 — 그 전에 온 �
 let composing = false;     // 내 칸에서 한글 조합 중인지
 let historyText = "";
 let lastValue = "";        // 마지막으로 서버에 보낸(= 송출된 부분이 온전한) 내 칸 글
+let boxGen = 0;            // 내 칸을 통째로 비울 때마다 +1 (그 전에 보낸 송출 요청의 응답을 버리려고)
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -27,7 +36,10 @@ const roleText = (r) => (r === "worker" ? "작업자" : r === "spectator" ? "관
 const nearBottom = (el) => el.scrollHeight - el.scrollTop - el.clientHeight < 30;
 
 function loadMe() {
-  try { return JSON.parse(sessionStorage.getItem(STORE_KEY)); } catch { return null; }
+  try {
+    const v = JSON.parse(sessionStorage.getItem(STORE_KEY));
+    return v && typeof v.room === "number" ? v : null; // 방이 하나이던 때 저장한 값은 버려요
+  } catch { return null; }
 }
 function saveMe(v) {
   me = v;
@@ -74,15 +86,31 @@ function resetRoomLocal() {
 }
 
 // ---------- 서버 이벤트 ----------
+// (재)연결되면 주소의 방을 다시 보고, 그 방에 내 자리가 있으면 다시 앉아요 (새로고침 → 같은 방, 같은 자리)
 socket.on("connect", () => {
   $("conn").classList.add("hidden");
-  if (me) socket.emit("join", { seat: me.seat, token: me.token });
+  enterRoute();
 });
+function enterRoute() {
+  if (currentRoom === null) return render();
+  if (me && me.room !== currentRoom) saveMe(null); // 다른 방 자리 정보 → 이 방에선 못 써요
+  socket.emit("watch", { room: currentRoom });
+  if (me) socket.emit("join", { room: currentRoom, seat: me.seat, token: me.token });
+}
 socket.on("disconnect", () => $("conn").classList.remove("hidden"));
-socket.on("state", (s) => { state = s; render(); });
+socket.on("state", (s) => {
+  if (s.room !== currentRoom) return; // 방을 옮긴 직후 늦게 온 이전 방 상태는 무시
+  state = s;
+  render();
+});
+socket.on("rooms", (list) => {
+  roomsList = Array.isArray(list) ? list : [];
+  if (currentRoom === null) renderRooms();
+});
 socket.on("joined", (d) => {
+  if (d.room !== currentRoom) return;
   const localBox = boxes.get(d.seat); // 있으면: 새로고침이 아니라 잠깐 끊겼다 재연결된 것
-  saveMe({ seat: d.seat, token: d.token });
+  saveMe({ room: d.room, seat: d.seat, token: d.token });
   joined = true;
 
   clearObj(texts); clearObj(sents); clearObj(exts);
@@ -128,6 +156,7 @@ socket.on("text", (d) => {
   if (isMyLiveBox(d.seat)) {
     if (!d.reset) return;
     // 서버가 내 칸을 비움 (자리 교체 등)
+    boxGen++;
     setMyValue(myBox(), "", 0);
     mySent = 0;
     myExt = d.ext || myExt;
@@ -169,6 +198,7 @@ socket.on("cut", (d) => {
 socket.on("resync", (d) => {
   const ta = myBox();
   if (!ta) return;
+  boxGen++;
   pendingOps = [];
   myExt = d.ext;
   mySent = d.sent;
@@ -204,8 +234,9 @@ function onMyInput(e) {
   const ta = e.currentTarget;
   if (!e.isComposing && checkReinsert(ta)) return;
   emitText();
-  // 대기중 작업자가 Enter → 내 칸 전체가 노란 창 (이어받을 준비 신호)
-  if (e.inputType === "insertLineBreak" && amWorker() && !amMain() && !(myInfo() || {}).standby) {
+  // 대기중 작업자가 Enter → 내 칸 전체가 노란 창 (이어받을 준비 신호). 칸이 비었거나 공백뿐이면 안 켜요.
+  // (켜진 뒤 글을 지워 비거나 공백만 남으면 서버가 자동으로 꺼요 — 다시 쓰고 Enter 치면 다시 켜짐)
+  if (e.inputType === "insertLineBreak" && amWorker() && !amMain() && !(myInfo() || {}).standby && ta.value.trim()) {
     socket.emit("standby");
   }
 }
@@ -266,7 +297,7 @@ const PHRASE_LINE = /^\s*[^:：\s]+\s*[:：]/;
 // 뒤쪽 2개만 남기고 앞에서부터 송출해요. 지금 치고 있는 마지막 어절(뒤에 공백 없음)은 세지 않아요.
 function maybeAutoSend() {
   const ta = myBox();
-  if (!ta || !amMain() || !socket.connected || clearPending) return;
+  if (!ta || !amMain() || !socket.connected || clearPending || turnPassing()) return;
   const v = ta.value;
   let limit = v.length;
   // 커서가 있는 줄이 상용구 등록 줄이면 그 줄 앞까지만 셈
@@ -298,8 +329,10 @@ function requestSend(offset) {
   if (!ta || offset <= mySent || offset > ta.value.length) return;
   mySent = offset;
   paintBox(me.seat);
+  const gen = boxGen;
   socket.timeout(5000).emit("send_upto", { offset, ext: myExt }, (err, res) => {
     if (err || !res || myBox() !== ta) return; // 응답이 없으면 재연결 때 다시 맞춰요
+    if (gen !== boxGen) return; // 그 사이 내 칸을 비웠음 (Insert/F12) → 옛 칸 기준 응답은 버려요
     // 서버 기준 위치 → 내 칸 기준 (아직 반영 못 한 정리만큼 더해서)
     let conv = res.sent;
     for (const op of pendingOps) if (op.ext > myExt && op.ext <= res.ext) conv += op.removed.length;
@@ -314,16 +347,43 @@ function requestSend(offset) {
   });
 }
 
-// 작성중 → 남은 송출 안 된 글(치고 있던 어절 포함)을 전부 송출한 뒤 턴 넘기기 (Insert / 버튼)
+// 작성중 → (Insert / 턴 넘기기 버튼) 순서대로:
+//   1) 남은 송출 안 된 글(자동 송출 대기 어절 + 치고 있던 어절)을 전부 송출
+//   2) 내 칸을 비우고 송출 위치 초기화 (서버가 다른 사람 화면에서도 비워요)
+//   3) 상대에게 턴 넘김
+// 서버는 한 사람이 보낸 이벤트를 보낸 순서대로 처리하므로 text → send_upto → clear_mine → pass_turn 순서가 지켜져요.
+// 한글 조합 중에 누르면 onMyKeydown이 조합 확정 뒤로 미뤄서 부르므로, 조합 중이던 글자까지 들어간 값으로 처리돼요.
+let passingUntil = 0;      // 턴을 넘기는 중 (서버 확인 전) — 중복 실행·자동 송출 막기
+const turnPassing = () => Date.now() < passingUntil;
+
 function passTurn() {
   if (!amMain()) return toast("작성중일 때만 턴을 넘길 수 있어요.");
+  if (turnPassing()) return;
   if (!socket.connected) return toast("서버와 연결이 끊겨 있어요.");
+  if (partnerSeat() === null) return toast("턴을 넘길 상대 작업자가 없어요.");
   const ta = myBox();
   if (ta) {
-    emitText();
-    if (ta.value.slice(mySent).trim()) requestSend(ta.value.length);
+    emitText();                                                   // 마지막 입력을 서버에 먼저
+    if (ta.value.slice(mySent).trim()) requestSend(ta.value.length); // 1) 남은 글 전부 송출
+    clearMyBox(ta);                                               // 2) 칸 비우기 + 송출 위치 초기화
   }
-  socket.emit("pass_turn");
+  passingUntil = Date.now() + 3000;
+  socket.emit("pass_turn");                                       // 3) 턴 넘김
+}
+
+// 내 칸 전체 + 송출 위치 초기화 (F12 / 턴 넘기기). 노란 창도 서버가 꺼요.
+function clearMyBox(ta) {
+  boxGen++;
+  ta.value = "";
+  lastValue = "";
+  mySent = 0;
+  pendingOps = [];
+  clearPending = true;
+  paintBox(me.seat);
+  socket.timeout(5000).emit("clear_mine", (err, res) => {
+    clearPending = false;
+    if (!err && res && res.ok) myExt = Math.max(myExt, res.ext);
+  });
 }
 
 // 상대의 F8: 내 칸의 송출 안 된 첫 어절(앞뒤 공백 포함)을 지움
@@ -481,6 +541,12 @@ function onMyKeydown(e) {
 
   const ta = e.currentTarget;
   const imeBusy = composing || e.isComposing || e.keyCode === 229;
+  // 윈도우 한글 IME: 조합 중에 키를 누르면 keydown이 두 번 와요 (조합 확정용 229 + 진짜 키).
+  // 한 번 누른 걸 두 번 처리하면 F10이 등록 후 빈 줄을 다시 검사해 "형식" 오류를 띄우거나,
+  // Insert가 턴을 두 번 넘기려 하므로 — 조합 중에 받은 키 직후 같은 키는 한 번 버려요.
+  const now = Date.now();
+  if (lastImeKey && lastImeKey.code === e.code && now - lastImeKey.t < 300) { lastImeKey = null; return; }
+  lastImeKey = imeBusy ? { code: e.code, t: now } : null;
   if (!imeBusy && queuedKeys === 0) return runAction(action, ta);
 
   // 한글 조합 중에 누른 단축키: 지금 value는 "확정 전" 글이라 여기서 칸을 고치면
@@ -502,6 +568,7 @@ function onMyKeydown(e) {
 let keyQueue = Promise.resolve();
 let queuedKeys = 0;        // 조합 확정을 기다리는 단축키 수
 let lastCommit = "";       // 마지막 compositionend의 확정 글자
+let lastImeKey = null;     // { code, t } — 조합 중에 받은 마지막 단축키 (중복 keydown 걸러내기)
 
 // 조합이 끝나고 브라우저가 확정 글자를 칸에 넣은 뒤에 resolve.
 // - 이미 조합이 끝났으면 setTimeout 0 한 번만 기다려요 (keyCode 229인데 compositionend가 먼저 온 경우).
@@ -602,17 +669,7 @@ function runAction(action, ta) {
       socket.emit("delete_partner_word");
       break;
     case "clearMine":
-      // 칸 전체 + 송출 위치 초기화 (노란 창도 꺼짐 — 서버가 처리)
-      ta.value = "";
-      lastValue = "";
-      mySent = 0;
-      pendingOps = [];
-      clearPending = true;
-      paintBox(me.seat);
-      socket.timeout(5000).emit("clear_mine", (err, res) => {
-        clearPending = false;
-        if (!err && res && res.ok) myExt = Math.max(myExt, res.ext);
-      });
+      clearMyBox(ta);
       break;
     case "pass":
       passTurn();
@@ -654,11 +711,16 @@ function registerPhrase(ta) {
   let end = v.indexOf("\n", pos);
   if (end === -1) end = v.length;
   const line = v.slice(start, end);
-  if (start < mySent) return toast("이미 송출된 줄은 상용구로 등록할 수 없어요.");
+  if (start < mySent) {
+    if (Date.now() - lastRegisterAt < 1000) return; // 키 중복 (위와 같은 이유)
+    return toast("이미 송출된 줄은 상용구로 등록할 수 없어요.");
+  }
 
   const m = line.match(/^\s*([^:：\s]+)\s*[:：](.*)$/); // 반각·전각 콜론 둘 다 허용
   const out = m ? m[2].trim() : "";   // 앞뒤 공백만 떼고 친 그대로
   if (!m || !out) {
+    // 방금 등록하고 그 줄을 지운 직후 다시 불렸으면(키 중복) 조용히 무시 — 성공 뒤에 "형식 오류"가 뜨지 않게
+    if (Date.now() - lastRegisterAt < 1000) return;
     return toast("상용구 형식: 한 줄에 입력어:출력어 (예: 굿:굿 굿즈) — 입력어는 띄어쓰기 없이");
   }
   if (!socket.connected) return toast("서버와 연결이 끊겨 있어 상용구를 저장할 수 없어요.");
@@ -672,14 +734,24 @@ function registerPhrase(ta) {
 
   phrases[key] = out; // 바로 F3을 눌러도 되게 먼저 반영 (서버 응답으로 확정)
   renderPhraseList();
-  socket.timeout(5000).emit("snippet_set", { key, out }, (err, res) => {
-    if (err || !res || !res.ok) {
-      socket.emit("snippets_get"); // 서버 목록으로 되돌림
-      return toast((res && res.message) || "상용구를 서버에 저장하지 못했어요. 다시 시도해주세요.");
-    }
-    toast(`상용구 ${res.replaced ? "덮어씀" : "등록"}: ${res.key} → ${res.out}`);
+  lastRegisterAt = Date.now();
+  const ok = () => toast(`등록되었습니다. (${key} → ${out})`);
+  const fail = (msg) => {
+    socket.emit("snippets_get"); // 서버 목록으로 되돌림
+    toast(msg || "상용구를 서버에 저장하지 못했어요. 다시 시도해주세요.");
+  };
+  socket.timeout(8000).emit("snippet_set", { key, out }, (err, res) => {
+    if (res && res.ok) return ok();
+    if (res) return fail(res.message); // 서버가 분명히 거절한 경우만 실패
+    // 응답이 늦거나 끊겼을 뿐 저장은 됐을 수 있어요 → 서버 목록에 실제로 들어갔는지 확인한 뒤 판단
+    socket.timeout(5000).emit("snippets_get", (err2, list) => {
+      const items = !err2 && list && list.items;
+      if (items && Object.prototype.hasOwnProperty.call(items, key) && items[key] === out) return ok();
+      fail();
+    });
   });
 }
+let lastRegisterAt = 0;
 
 // F3: 커서 바로 앞 어절이 입력어면 출력어로 바꿔요
 function expandPhrase(ta) {
@@ -1073,6 +1145,102 @@ window.addEventListener("blur", () => {
   }, 0);
 });
 
+// ---------- 세 칸 폭 조절 (영상 / 입력칸 / 송출 이력) — 각자 브라우저에 저장 ----------
+// 폭은 비율(합 100)로 들고 있다가 CSS 변수 --col-a/b/c 로 넣어요. 경계선을 끌면 양옆 두 칸만 바뀌어요.
+// "영상 크게": 지금 비율을 기억해 두고 영상 칸을 넓힌 비율로 → 다시 누르면 기억한 비율로 되돌려요.
+const LAYOUT_KEY = "live_layout";
+const COLS_DEFAULT = [45, 32, 23];
+const COLS_VIDEO_BIG = [62, 23, 15];
+const COL_MIN_PX = 200;    // 칸 최소 폭
+let layout = loadLayout(); // { cols: [a,b,c], big: bool, prev: [a,b,c] | null }
+
+function validCols(c) {
+  return Array.isArray(c) && c.length === 3 && c.every((n) => typeof n === "number" && Number.isFinite(n) && n > 0);
+}
+function normCols(c) {
+  const sum = c[0] + c[1] + c[2];
+  return c.map((n) => (n / sum) * 100);
+}
+function loadLayout() {
+  const out = { cols: COLS_DEFAULT.slice(), big: false, prev: null };
+  try {
+    const v = JSON.parse(localStorage.getItem(LAYOUT_KEY));
+    if (v && validCols(v.cols)) out.cols = normCols(v.cols);
+    if (v && v.big && validCols(v.prev)) { out.big = true; out.prev = normCols(v.prev); }
+  } catch {}
+  return out;
+}
+function saveLayout() {
+  try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout)); } catch {}
+}
+function applyLayout() {
+  const g = document.querySelector(".work-grid");
+  ["a", "b", "c"].forEach((k, i) => g.style.setProperty(`--col-${k}`, `${layout.cols[i].toFixed(3)}fr`));
+  const b = $("video-big");
+  b.textContent = layout.big ? "원래대로" : "영상 크게";
+  b.classList.toggle("on", layout.big);
+  b.setAttribute("aria-pressed", String(layout.big));
+}
+applyLayout();
+
+$("video-big").addEventListener("click", () => {
+  if (layout.big) {
+    layout = { cols: layout.prev || COLS_DEFAULT.slice(), big: false, prev: null };
+  } else {
+    layout = { cols: COLS_VIDEO_BIG.slice(), big: true, prev: layout.cols.slice() };
+  }
+  applyLayout();
+  saveLayout();
+  const box = myBox();
+  if (box && lastFocused === box) box.focus(); // 치던 칸으로 돌아가요
+});
+
+// 경계선 끌기 (Pointer Events + 포인터 캡처: 영상 iframe 위로 지나가도 안 끊겨요)
+document.querySelectorAll(".col-resizer").forEach((bar) => {
+  const i = Number(bar.dataset.resizer); // 0: 영상|입력칸, 1: 입력칸|송출 이력
+  bar.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const grid = bar.parentElement;
+    const panels = [...grid.children].filter((el) => el.classList.contains("panel"));
+    const widths = panels.map((p) => p.getBoundingClientRect().width);
+    const total = widths[0] + widths[1] + widths[2];
+    const pairStart = panels[i].getBoundingClientRect().left;
+    const pair = widths[i] + widths[i + 1];
+    const gutter = bar.getBoundingClientRect().width;
+    const min = Math.min(COL_MIN_PX, pair / 2 - 1);
+    bar.setPointerCapture(e.pointerId);
+    bar.classList.add("dragging");
+    document.body.classList.add("col-resizing");
+
+    const move = (ev) => {
+      const left = Math.max(min, Math.min(pair - min, ev.clientX - pairStart - gutter / 2));
+      const px = widths.slice();
+      px[i] = left;
+      px[i + 1] = pair - left;
+      layout.cols = px.map((w) => (w / total) * 100);
+      applyLayout();
+    };
+    const up = () => {
+      bar.removeEventListener("pointermove", move);
+      bar.removeEventListener("pointerup", up);
+      bar.removeEventListener("pointercancel", up);
+      bar.classList.remove("dragging");
+      document.body.classList.remove("col-resizing");
+      saveLayout();
+    };
+    bar.addEventListener("pointermove", move);
+    bar.addEventListener("pointerup", up);
+    bar.addEventListener("pointercancel", up);
+  });
+  // 더블클릭: 기본 크기로
+  bar.addEventListener("dblclick", () => {
+    layout = { cols: COLS_DEFAULT.slice(), big: false, prev: null };
+    applyLayout();
+    saveLayout();
+  });
+});
+
 // ---------- 송출 이력 ----------
 // 송출 이력은 옆 패널과 "크게 보기" 화면 두 곳에 똑같이 그려요. 최신 줄이 항상 보이게 맨 아래로.
 const historyEls = () => [$("history"), $("big-text")];
@@ -1191,12 +1359,125 @@ $("history-clear").addEventListener("click", () => {
 
 // ---------- 화면 그리기 ----------
 function render() {
+  if (currentRoom === null) {
+    // 첫 화면: 방 목록
+    $("rooms").classList.remove("hidden");
+    $("lobby").classList.add("hidden");
+    $("room").classList.add("hidden");
+    document.title = "실시간 방송 자막";
+    return renderRooms();
+  }
+  $("rooms").classList.add("hidden");
   if (!state) return;
   const inRoom = joined && me && state.seats[me.seat] && state.seats[me.seat].taken;
   $("lobby").classList.toggle("hidden", inRoom);
   $("room").classList.toggle("hidden", !inRoom);
+  document.title = `${state.room_name} · 실시간 방송 자막`;
+  $("lobby-title").textContent = state.room_name;
+  $("room-name").textContent = state.room_name;
   if (inRoom) renderRoom(); else renderLobby();
 }
+
+// ---------- 방 목록 / 방 이동 ----------
+function renderRooms() {
+  const grid = $("room-grid");
+  const activeEl = document.activeElement;
+  if (editingRoom !== null && activeEl && activeEl.classList.contains("room-name-input")) return; // 입력 중이면 다시 그리지 않음
+  grid.innerHTML = roomsList.map((r) => {
+    const nameHtml = editingRoom === r.id
+      ? `<input class="seat-name-input room-name-input" data-room-input="${r.id}" maxlength="20" value="${esc(r.name)}">`
+      : `<span class="room-title" title="${esc(r.name)}">${esc(r.name)}</span>`;
+    return `
+      <div class="room-card" data-room="${r.id}" role="button" tabindex="0" aria-label="${esc(r.name)} 들어가기">
+        <div class="room-top">
+          ${nameHtml}
+          <button class="icon-btn" data-rename-room="${r.id}" title="방 이름 바꾸기">✏️</button>
+        </div>
+        <div class="room-counts">
+          <span class="room-count workers">작업자 ${r.workers}/${r.max_workers}</span>
+          <span class="room-count">관전자 ${r.spectators}</span>
+        </div>
+        <span class="room-num">방 ${r.id} · <span class="room-enter">들어가기 →</span></span>
+      </div>`;
+  }).join("") || '<p class="sub">방 목록을 불러오는 중…</p>';
+
+  const input = grid.querySelector(".room-name-input");
+  if (input) {
+    input.focus();
+    input.select();
+    const finish = (save) => {
+      if (editingRoom === null) return;
+      const room = Number(input.dataset.roomInput);
+      editingRoom = null;
+      if (save && input.value.trim()) socket.emit("rename_room", { room, name: input.value });
+      renderRooms();
+    };
+    input.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") finish(true);
+      if (e.key === "Escape") finish(false);
+    });
+    input.addEventListener("click", (e) => e.stopPropagation());
+    input.addEventListener("blur", () => finish(true), { once: true });
+  }
+}
+
+$("room-grid").addEventListener("click", (e) => {
+  const ren = e.target.closest("[data-rename-room]");
+  if (ren) {
+    e.stopPropagation();
+    editingRoom = Number(ren.dataset.renameRoom);
+    return renderRooms();
+  }
+  if (e.target.closest(".room-name-input")) return;
+  const card = e.target.closest("[data-room]");
+  if (card) goRoom(Number(card.dataset.room));
+});
+$("room-grid").addEventListener("keydown", (e) => {
+  const card = e.target.closest("[data-room]");
+  if (card && e.target === card && (e.key === "Enter" || e.key === " ")) {
+    e.preventDefault();
+    goRoom(Number(card.dataset.room));
+  }
+});
+
+// 방으로 이동 (방 목록 → 방 입장 화면). 주소도 /room/N 으로
+function goRoom(n, push = true) {
+  if (joined) return;
+  if (push) history.pushState({ room: n }, "", `/room/${n}`);
+  currentRoom = n;
+  state = null;
+  editingSeat = null;
+  resetRoomLocal();
+  setHistory("");
+  enterRoute();
+  render();
+}
+// 방 목록으로 (자리에 앉아 있지 않을 때만 — 앉아 있으면 "나가기" 먼저)
+function goRooms(push = true) {
+  if (joined) return toast("먼저 '나가기'를 눌러 자리에서 나와주세요.");
+  if (push) history.pushState({}, "", "/");
+  socket.emit("unwatch");
+  currentRoom = null;
+  state = null;
+  editingRoom = null;
+  resetRoomLocal();
+  setHistory("");
+  render();
+}
+$("to-rooms").addEventListener("click", () => goRooms());
+
+// 브라우저 뒤로/앞으로
+window.addEventListener("popstate", () => {
+  const target = roomFromPath();
+  if (target === currentRoom) return;
+  if (joined) {
+    // 자리에 앉아 있으면 주소만 되돌리고 그대로 (실수로 자리를 잃지 않게)
+    history.pushState({ room: currentRoom }, "", `/room/${currentRoom}`);
+    return toast("먼저 '나가기'를 눌러 자리에서 나와주세요.");
+  }
+  if (target === null) goRooms(false); else goRoom(target, false);
+});
 
 function seatStatus(s) {
   if (!s.taken) return { dot: "", text: "비어 있음" };
@@ -1252,7 +1533,7 @@ $("seat-grid").addEventListener("click", (e) => {
   if (join && !join.disabled) {
     saveMe(null);
     resetRoomLocal();
-    socket.emit("join", { seat: Number(join.dataset.join) });
+    socket.emit("join", { room: currentRoom, seat: Number(join.dataset.join) });
   } else if (rename && !rename.disabled) {
     editingSeat = Number(rename.dataset.rename);
     renderLobby();
@@ -1293,11 +1574,11 @@ function renderRoom() {
     }
     // 대기 작업자가 Enter를 쳤으면 칸 전체가 노란 창 (턴을 받으면 서버가 꺼요)
     boxes.get(w.id).parentElement.classList.toggle("standby", !!w.standby && !isMain);
+    // 이름 앞 배지: 작성중 = 초록, 대기중 = 주황 (모든 사람 화면에서 같은 state로 그려요)
     el.querySelector(".writer-head").innerHTML =
-      `<span class="dot ${w.online ? "worker" : "offline"}"></span>
+      `<span class="turn-badge ${isMain ? "writing" : "waiting"}">${isMain ? "작성중" : "대기중"}</span>
        <span class="who">${esc(w.name)}</span>${isMe ? '<span class="tag">(나)</span>' : ""}
-       <span class="turn-tag ${isMain ? "on" : ""}">${isMain ? "작성중" : "대기중"}</span>
-       ${w.online ? "" : '<span class="tag">연결 끊김</span>'}
+       ${w.online ? "" : '<span class="dot offline"></span><span class="tag">연결 끊김</span>'}
        ${isMe && isMain ? '<button class="btn small pass-btn" data-pass title="단축키: Insert">턴 넘기기</button>' : ""}`;
   }
   // 더 이상 작업자가 아닌 자리의 칸은 버림
@@ -1312,11 +1593,11 @@ function renderRoom() {
 
   const worker = amWorker();
   updateVideoUI();
-  $("key-hint").classList.toggle("hidden", !worker);
   $("history-clear").classList.toggle("hidden", !worker);
 
   // 작업자 → 관전자로 바뀌었으면 내 칸 관련 상태 정리
   if (!worker) { pendingOps = []; afterIme = []; composing = false; }
+  if (!amMain()) passingUntil = 0; // 턴이 넘어간 게 확인됨
   if (amMain()) maybeAutoSend(); // 턴을 받았을 때 이미 완성 어절이 3개 이상이면 바로 송출
   if (swapArm && !(worker && state.seats[swapArm.target] && state.seats[swapArm.target].ready)) disarmSwap();
 
