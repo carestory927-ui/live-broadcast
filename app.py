@@ -671,25 +671,33 @@ def on_text(data):
         room.texts[seat_id] = text
         room.emit("text", {"seat": seat_id, "text": text, "sent": room.sent[seat_id], "ext": room.ext_ver[seat_id]},
                   skip_sid=request.sid)
-        # 노란 창이 켜진 대기 작업자가 글을 지워 칸이 비거나 공백만 남으면 노란 창을 꺼요
-        standby_off = room.seats[seat_id]["standby"] and not text.strip()
-        if standby_off:
-            room.seats[seat_id]["standby"] = False
-    if standby_off:
-        room.broadcast()
 
 
 @socketio.on("standby")
 def on_standby():
-    """대기 작업자가 자기 칸에서 Enter → 칸 전체가 노란 창 (이어받을 준비 됐다는 신호).
-    칸이 비어 있거나 공백만 있으면 켜지 않아요 (글을 지우면 on_text에서 자동으로 꺼져요)."""
+    """대기 작업자가 자기 칸에서 Enter → 칸 전체가 노란 창 ("다음 문장은 내가 들어갈게" 신호).
+    칸이 비어 있어도 켜요. 꺼지는 건 턴을 받았을 때(broadcast)와 standby_off / clear_box 뿐이에요."""
     with lock:
         room, seat_id = ctx()
         if room is None or not room.is_worker(seat_id) or seat_id == room.main_seat:
             return
-        if room.seats[seat_id]["standby"] or not room.texts[seat_id].strip():
+        if room.seats[seat_id]["standby"]:
             return
         room.seats[seat_id]["standby"] = True
+    room.broadcast()
+
+
+@socketio.on("standby_off")
+def on_standby_off():
+    """노란 창이 켜진 대기 작업자가 지우는 동작(Backspace/Delete/F4/F8)으로 칸을 비웠을 때 꺼요.
+    클라이언트가 text를 먼저 보내므로 서버 글로 한 번 더 확인해요."""
+    with lock:
+        room, seat_id = ctx()
+        if room is None or not room.is_worker(seat_id):
+            return
+        if not room.seats[seat_id]["standby"] or room.texts[seat_id].strip():
+            return
+        room.seats[seat_id]["standby"] = False
     room.broadcast()
 
 

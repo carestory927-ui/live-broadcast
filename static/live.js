@@ -263,11 +263,33 @@ function onMyInput(e) {
   const ta = e.currentTarget;
   if (!e.isComposing && checkReinsert(ta)) return;
   emitText();
-  // 대기중 작업자가 Enter → 내 칸 전체가 노란 창 (이어받을 준비 신호). 칸이 비었거나 공백뿐이면 안 켜요.
-  // (켜진 뒤 글을 지워 비거나 공백만 남으면 서버가 자동으로 꺼요 — 다시 쓰고 Enter 치면 다시 켜짐)
-  if (e.inputType === "insertLineBreak" && amWorker() && !amMain() && !(myInfo() || {}).standby && ta.value.trim()) {
-    socket.emit("standby");
+  // Backspace/Delete/잘라내기 등 "지우는 동작"으로 칸이 비면 노란 창을 꺼요
+  if (e.inputType && e.inputType.startsWith("delete")) standbyOffIfEmpty(ta);
+}
+
+// ---------- 노란 창 (대기 작업자의 "다음 문장은 내가 들어갈게" 신호) ----------
+// 대기중 작업자가 Enter → 칸에 글이 있든 없든 칸 전체가 노란 창.
+//   - 칸이 비었거나 공백뿐이면 줄바꿈은 넣지 않고 신호만, 글이 있으면 줄바꿈 + 신호.
+//   - 꺼지는 경우: 턴을 받았을 때(서버가 끔) / 지우는 동작(Backspace·Delete·F4·F8·F12)으로 칸이 비었을 때.
+//   - "칸이 비었는지"는 Enter 때가 아니라 지우는 동작 때만 검사해요.
+const amWaiting = () => amWorker() && !amMain();
+
+function onStandbyEnter(e, ta) {
+  if (e.key !== "Enter" && e.code !== "Enter" && e.code !== "NumpadEnter") return;
+  if (e.ctrlKey || e.altKey || e.metaKey || !amWaiting()) return;
+  if (composing || e.isComposing || e.keyCode === 229) {
+    // 한글 조합 중: 조합 확정 뒤에 신호를 켜요 (줄바꿈은 브라우저가 확정과 함께 넣어요)
+    afterComposition(ta).then(() => { if (myBox() === ta && amWaiting()) socket.emit("standby"); });
+    return;
   }
+  if (!ta.value.trim()) e.preventDefault(); // 빈 칸 → 줄바꿈 없이 신호만
+  socket.emit("standby");
+}
+
+// 지우는 동작 뒤에 호출: 노란 창이 켜져 있고 칸이 비었으면(공백만 남아도) 끄기
+function standbyOffIfEmpty(ta) {
+  if (!ta || ta.value.trim() || !(myInfo() || {}).standby) return;
+  socket.emit("standby_off");
 }
 
 // 내 칸 글을 코드로 바꿀 때 (스크롤 유지, 커서 위치 지정)
@@ -430,6 +452,7 @@ function deleteFirstUnsent() {
   ta.setSelectionRange(s, e);
   ta.scrollTop = top;
   emitText();
+  standbyOffIfEmpty(ta);
 }
 
 // 한글 조합 중이면 조합이 끝난 뒤에 실행 (조합 중에 칸을 고치면 글자가 꼬여요)
@@ -559,6 +582,7 @@ const NO_REPEAT = new Set(["pass", "clearMine", "register", "expand"]); // 꾹 �
 function onMyKeydown(e) {
   guardSentKeydown(e, e.currentTarget);
   guardBackspaceAtEdge(e, e.currentTarget);
+  onStandbyEnter(e, e.currentTarget);
   // 한글 조합 중엔 e.key가 "Process"일 수 있어서 물리 키(e.code)를 먼저 봐요
   const action = KEYS[e.code] || KEYS[e.key];
   if (!action) return;
@@ -691,6 +715,7 @@ function runAction(action, ta) {
       ta.value = nv;
       ta.setSelectionRange(s, en);
       emitText();
+      standbyOffIfEmpty(ta);
       break;
     }
     case "delPartner":
