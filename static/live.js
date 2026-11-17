@@ -142,6 +142,7 @@ socket.on("joined", (d) => {
   for (const [seat, ta] of boxes) if (Number(seat) !== d.seat) setBoxText(ta, texts[seat] || "");
 
   setHistory(d.history || "");
+  if (d.state && d.state.room === currentRoom) state = d.state; // 입장 순간의 방 상태(노란 창 포함)
   render();
   applyVideo(d.video);
 });
@@ -268,9 +269,10 @@ function onMyInput(e) {
 }
 
 // ---------- 노란 창 (대기 작업자의 "다음 문장은 내가 들어갈게" 신호) ----------
-// 대기중 작업자가 Enter → 칸에 글이 있든 없든 칸 전체가 노란 창.
-//   - 칸이 비었거나 공백뿐이면 줄바꿈은 넣지 않고 신호만, 글이 있으면 줄바꿈 + 신호.
-//   - 꺼지는 경우: 턴을 받았을 때(서버가 끔) / 지우는 동작(Backspace·Delete·F4·F8·F12)으로 칸이 비었을 때.
+// 대기중 작업자가 Enter → 칸이 비어 있든 글이 있든 항상 "줄바꿈 + 노란 창" 둘 다.
+//   - 줄바꿈은 브라우저 기본 동작으로 들어가고, input 이벤트(emitText)로 다른 사람 화면에도 바로 보여요.
+//   - 줄바꿈·공백만 있는 칸이어도 Enter로 켠 노란 창은 유지돼요.
+//   - 꺼지는 경우: 턴을 받았을 때(서버가 끔) / 지우는 동작(Backspace·Delete·F4·F8·F12)으로 칸이 완전히 비었을 때.
 //   - "칸이 비었는지"는 Enter 때가 아니라 지우는 동작 때만 검사해요.
 const amWaiting = () => amWorker() && !amMain();
 
@@ -282,13 +284,13 @@ function onStandbyEnter(e, ta) {
     afterComposition(ta).then(() => { if (myBox() === ta && amWaiting()) socket.emit("standby"); });
     return;
   }
-  if (!ta.value.trim()) e.preventDefault(); // 빈 칸 → 줄바꿈 없이 신호만
+  // 줄바꿈은 막지 않아요 (빈 칸이어도 줄바꿈 + 신호)
   socket.emit("standby");
 }
 
-// 지우는 동작 뒤에 호출: 노란 창이 켜져 있고 칸이 비었으면(공백만 남아도) 끄기
+// 지우는 동작 뒤에 호출: 노란 창이 켜져 있고 칸이 완전히 비었으면 끄기 (줄바꿈·공백이 남아 있으면 유지)
 function standbyOffIfEmpty(ta) {
-  if (!ta || ta.value.trim() || !(myInfo() || {}).standby) return;
+  if (!ta || ta.value !== "" || !(myInfo() || {}).standby) return;
   socket.emit("standby_off");
 }
 
@@ -525,11 +527,16 @@ function applyPendingOps(force = false) {
   emitText(); // 서버와 최종 글을 맞춰요 (버전도 최신으로)
 }
 
+// 입력칸 하나를 자리마다 재사용해요. 단, "내 칸(입력 + Enter/단축키 리스너)"인지 "읽기 전용"인지가
+// 지금 역할과 다르면(관전자→작업자 승격, 자리 교체, 같은 자리 번호에 다른 사람 등) 버리고 새로 만들어요.
+// → 리스너가 빠지거나 예전 역할 기준으로 남는 일이 없어요. (Enter 처리 자체도 누를 때의 역할을 다시 확인해요)
 function getBox(seatId, isMe) {
   let ta = boxes.get(seatId);
-  if (ta) return ta;
+  if (ta && (ta.dataset.mine === "1") === isMe) return ta;
+  if (ta) { boxes.delete(seatId); ta.parentElement.remove(); }
   ta = document.createElement("textarea");
   ta.dataset.seat = seatId;
+  ta.dataset.mine = isMe ? "1" : "0";
   ta.spellcheck = false;
   ta.value = texts[seatId] || "";
   // 송출된 부분 표시는 textarea 뒤에 겹친 배경 레이어(div)에 그려요
@@ -1621,10 +1628,11 @@ function renderRoom() {
     const isMain = state.main_seat === w.id;
     el.className = `writer${isMain ? " main" : ""}`;
     // textarea는 자리마다 하나를 계속 재사용 (다시 만들면 커서·조합이 날아가요)
-    if (el.dataset.seat !== String(w.id) || !el.contains(boxes.get(w.id))) {
+    const box = getBox(w.id, isMe);
+    if (el.dataset.seat !== String(w.id) || !el.contains(box)) {
       el.dataset.seat = w.id;
       el.innerHTML = `<div class="writer-head"></div>`;
-      el.appendChild(getBox(w.id, isMe).parentElement); // textarea + 송출 표시 레이어
+      el.appendChild(box.parentElement); // textarea + 송출 표시 레이어
     }
     // 대기 작업자가 Enter를 쳤으면 칸 전체가 노란 창 (턴을 받으면 서버가 꺼요)
     boxes.get(w.id).parentElement.classList.toggle("standby", !!w.standby && !isMain);

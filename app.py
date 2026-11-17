@@ -220,6 +220,13 @@ class Room:
         ws = self.workers_in_order()
         self.main_seat = ws[0]["id"] if ws else None
 
+    def set_role(self, seat_id, role):
+        """자리의 역할을 바꿔요. 역할이 바뀌면 초록불·노란 창은 새로 시작해요 (노란 창은 "지금 그 자리 작업자" 것)."""
+        s = self.seats[seat_id]
+        s["role"] = role
+        s["ready"] = False
+        s["standby"] = False
+
     def promote_spectators(self):
         """작업자 자리가 비면 가장 먼저 온 관전자를 작업자로 올려요."""
         while self.worker_count() < MAX_WORKERS:
@@ -229,8 +236,7 @@ class Room:
             )
             if not waiting:
                 break
-            waiting[0]["role"] = "worker"
-            waiting[0]["ready"] = False
+            self.set_role(waiting[0]["id"], "worker")
 
     def release_seat(self, seat_id):
         s = self.seats[seat_id]
@@ -562,7 +568,7 @@ def on_join(data):
             s["sid"] = request.sid
             s["online"] = True
             s["joined_at"] = time.time()
-            s["role"] = "worker" if room.worker_count() < MAX_WORKERS else "spectator"
+            room.set_role(seat_id, "worker" if room.worker_count() < MAX_WORKERS else "spectator")
             room.texts[seat_id] = ""
             room.sent[seat_id] = 0
             room.ext_ops[seat_id] = []
@@ -579,6 +585,8 @@ def on_join(data):
             "my_ops": [[v, r] for v, r in room.ext_ops[seat_id]],
             "history": room.history,
             "video": room.video_msg(),
+            # 지금 방 상태(노란 창 포함)도 같이 → 입장/새로고침 직후부터 노란색이 그대로 보여요
+            "state": room.public_state(),
         }
 
     emit("joined", payload)
@@ -689,13 +697,13 @@ def on_standby():
 
 @socketio.on("standby_off")
 def on_standby_off():
-    """노란 창이 켜진 대기 작업자가 지우는 동작(Backspace/Delete/F4/F8)으로 칸을 비웠을 때 꺼요.
-    클라이언트가 text를 먼저 보내므로 서버 글로 한 번 더 확인해요."""
+    """노란 창이 켜진 대기 작업자가 지우는 동작(Backspace/Delete/F4/F8)으로 칸을 완전히 비웠을 때 꺼요.
+    줄바꿈·공백만 남아 있으면 유지해요. 클라이언트가 text를 먼저 보내므로 서버 글로 한 번 더 확인해요."""
     with lock:
         room, seat_id = ctx()
         if room is None or not room.is_worker(seat_id):
             return
-        if not room.seats[seat_id]["standby"] or room.texts[seat_id].strip():
+        if not room.seats[seat_id]["standby"] or room.texts[seat_id]:
             return
         room.seats[seat_id]["standby"] = False
     room.broadcast()
@@ -771,8 +779,8 @@ def on_swap(data):
         w = room.seats[me_id]
         # 관전자는 작업자의 자리 순서를 그대로 이어받고, 작업자는 대기열 맨 뒤로
         t["joined_at"], w["joined_at"] = w["joined_at"], time.time()
-        t["role"], w["role"] = "worker", "spectator"
-        t["ready"] = w["ready"] = False
+        room.set_role(target, "worker")
+        room.set_role(me_id, "spectator")
         if room.main_seat == me_id:
             room.main_seat = target
         for sid_ in (me_id, target):  # 두 칸 모두 빈 칸으로 새로 시작 (작업자의 남은 글은 삭제)
